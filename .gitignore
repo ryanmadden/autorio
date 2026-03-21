@@ -1,0 +1,4 @@
+/factorio/
+/node_modules/
+/dist/
+.env

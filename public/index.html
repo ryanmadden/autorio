@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Factorio Server Manager</title>
+    <style>
+      :root {
+        --bg: #0e1114;
+        --panel: #151a1f;
+        --text: #e5e7eb;
+        --muted: #9ca3af;
+        --accent: #f59e0b;
+        --ok: #34d399;
+        --bad: #f87171;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+        background: radial-gradient(1200px 600px at 20% -10%, #1f2937, #0e1114);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 1000px;
+        margin: 0 auto;
+        padding: 32px 20px 64px;
+      }
+      h1 {
+        margin: 0 0 16px;
+        font-size: 28px;
+        letter-spacing: 0.5px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid #222b35;
+        border-radius: 10px;
+        padding: 16px;
+        margin: 12px 0;
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+      }
+      .row {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      select,
+      button,
+      input {
+        background: #0b1016;
+        color: var(--text);
+        border: 1px solid #2b3644;
+        border-radius: 6px;
+        padding: 8px 12px;
+        font-size: 14px;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: var(--accent);
+      }
+      input.rcon {
+        flex: 1 1 420px;
+        min-width: 200px;
+      }
+      .status {
+        display: grid;
+        grid-template-columns: 160px 1fr;
+        gap: 8px 12px;
+        font-size: 14px;
+      }
+      .badge {
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 12px;
+        border: 1px solid transparent;
+        display: inline-block;
+      }
+      .badge.ok {
+        background: rgba(52, 211, 153, 0.1);
+        border-color: rgba(52, 211, 153, 0.5);
+        color: var(--ok);
+      }
+      .badge.bad {
+        background: rgba(248, 113, 113, 0.1);
+        border-color: rgba(248, 113, 113, 0.5);
+        color: var(--bad);
+      }
+      .muted {
+        color: var(--muted);
+      }
+      pre {
+        background: #0b1016;
+        border: 1px solid #2b3644;
+        padding: 12px;
+        border-radius: 8px;
+        overflow: auto;
+        max-height: 320px;
+        white-space: pre-wrap;
+      }
+      .meta {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .small {
+        font-size: 12px;
+      }
+      canvas {
+        width: 100%;
+        max-width: 100%;
+        border: 1px solid #2b3644;
+        background: #0b1016;
+        border-radius: 8px;
+        image-rendering: pixelated;
+      }
+      .legend {
+        margin-top: 8px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 12px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .legend-swatch {
+        width: 12px;
+        height: 12px;
+        border-radius: 3px;
+        border: 1px solid #2b3644;
+      }
+      .world-wrap {
+        position: relative;
+        margin-top: 12px;
+      }
+      .tooltip {
+        position: absolute;
+        pointer-events: none;
+        background: rgba(9, 12, 16, 0.95);
+        border: 1px solid #2b3644;
+        color: var(--text);
+        padding: 6px 8px;
+        border-radius: 6px;
+        font-size: 12px;
+        white-space: pre;
+        transform: translate(12px, 12px);
+        max-width: 260px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Factorio Headless Manager</h1>
+
+      <div class="panel">
+        <div class="row">
+          <div>
+            <select id="saveSelect"></select>
+          </div>
+          <button id="refreshBtn">Refresh Saves</button>
+          <button id="startBtn">Start Server</button>
+          <button id="stopBtn">Stop Server</button>
+          <div id="apiMsg" class="muted small"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="status" id="status"></div>
+      </div>
+
+      <div class="panel">
+        <div class="meta">
+          <div class="muted">RCON Command</div>
+          <div id="rconMeta" class="muted small"></div>
+        </div>
+        <div class="row" style="margin-top: 8px">
+          <input id="rconInput" class="rcon" placeholder="/help" />
+          <button id="rconSendBtn">Send</button>
+        </div>
+        <pre id="rconOutput"></pre>
+      </div>
+
+      <div class="panel">
+        <div class="meta">
+          <div class="muted">World Info</div>
+          <div id="worldMeta" class="muted small"></div>
+        </div>
+        <div class="row" style="margin-top: 8px">
+          <button id="worldFetchBtn">Fetch World Info</button>
+          <button id="placeItemsBtn">Place Test Items</button>
+        </div>
+        <div class="world-wrap">
+          <canvas id="worldCanvas" width="500" height="500"></canvas>
+          <div id="worldTooltip" class="tooltip"></div>
+        </div>
+        <div id="worldLegend" class="legend"></div>
+        <pre id="worldOutput"></pre>
+      </div>
+
+      <div class="panel">
+        <div class="meta">
+          <div class="muted">Live Log Tail</div>
+          <div id="logMeta" class="muted small"></div>
+        </div>
+        <pre id="log"></pre>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
