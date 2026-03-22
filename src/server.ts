@@ -45,6 +45,15 @@ const RCON_PASSWORD = process.env.RCON_PASSWORD || "";
 
 const RCON_AUTH_ID = 0x1234;
 
+const AGENT_DEFAULT_RADIUS = 12;
+const AGENT_MAX_TILES = 625;
+const AGENT_MAX_ENTITIES = 200;
+const AGENT_MAX_INVENTORY_SLOTS = 200;
+const AGENT_MAX_EQUIPMENT_SLOTS = 50;
+const AGENT_MAX_RECIPES = 300;
+const AGENT_MAX_RESEARCH = 200;
+const AGENT_MAX_ACTIONS = 50;
+
 type LastExit = {
   code: number | null;
   signal: NodeJS.Signals | null;
@@ -310,6 +319,595 @@ function placeTestItemsCommand(): string {
     "table.insert(out,entry)",
     "end",
     "table.insert(out,']')",
+    "rcon.print('{'..table.concat(out,',')..'}')",
+  ];
+  return parts.join(" ");
+}
+
+function clampInt(value: unknown, fallback: number, min: number, max: number) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(num)));
+}
+
+function luaString(value: string) {
+  return `"${value.replace(/\\\\/g, "\\\\\\\\").replace(/\"/g, "\\\\\"")}"`;
+}
+
+function agentWorldCommand(params: {
+  x: number;
+  y: number;
+  radius: number;
+  includeTiles: boolean;
+  includeEntities: boolean;
+  tileLimit: number;
+  entityLimit: number;
+}): string {
+  const minX = params.x - params.radius;
+  const maxX = params.x + params.radius;
+  const minY = params.y - params.radius;
+  const maxY = params.y + params.radius;
+  const parts = [
+    "/c",
+    "local s=game.surfaces[1]",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    `local min_x=${minX}`,
+    `local max_x=${maxX}`,
+    `local min_y=${minY}`,
+    `local max_y=${maxY}`,
+    `local tile_limit=${params.tileLimit}`,
+    `local entity_limit=${params.entityLimit}`,
+    "local tiles_out={}",
+    "local tiles_total=0",
+    "local tiles_included=0",
+    "if true then",
+    `local include_tiles=${params.includeTiles ? "true" : "false"}`,
+    "if include_tiles then",
+    "for y=min_y,max_y do",
+    "for x=min_x,max_x do",
+    "tiles_total=tiles_total+1",
+    "if tiles_included < tile_limit then",
+    "local t=s.get_tile(x,y)",
+    "table.insert(tiles_out,'{\"x\":'..x..',\"y\":'..y..',\"name\":'..esc(t.name)..'}')",
+    "tiles_included=tiles_included+1",
+    "end",
+    "end",
+    "end",
+    "end",
+    "end",
+    "local entities_out={}",
+    "local entities_total=0",
+    "local entities_included=0",
+    `local include_entities=${params.includeEntities ? "true" : "false"}`,
+    "if include_entities then",
+    "local entities=s.find_entities_filtered{area={{min_x,min_y},{max_x+1,max_y+1}}} or {}",
+    "entities_total=#entities",
+    "for i=1,#entities do",
+    "if entities_included >= entity_limit then break end",
+    "local e=entities[i]",
+    "local force_name=e.force and e.force.name or nil",
+    "local health=e.health",
+    "local box=nil",
+    "local ok_box,proto=pcall(function() return e.prototype end)",
+    "if ok_box and proto and proto.collision_box then box=proto.collision_box end",
+    "local box_left=nil",
+    "local box_top=nil",
+    "local box_right=nil",
+    "local box_bottom=nil",
+    "if box and box.left_top and box.right_bottom then",
+    "box_left=e.position.x + box.left_top.x",
+    "box_top=e.position.y + box.left_top.y",
+    "box_right=e.position.x + box.right_bottom.x",
+    "box_bottom=e.position.y + box.right_bottom.y",
+    "end",
+    "local tile_x=math.floor(e.position.x)",
+    "local tile_y=math.floor(e.position.y)",
+    "local entry='{\"name\":'..esc(e.name)..',\"type\":'..esc(e.type)..',\"x\":'..esc(e.position.x)",
+    "entry=entry..',\"y\":'..esc(e.position.y)..',\"tile_x\":'..esc(tile_x)..',\"tile_y\":'..esc(tile_y)",
+    "entry=entry..',\"box_left\":'..esc(box_left)..',\"box_top\":'..esc(box_top)..',\"box_right\":'..esc(box_right)..',\"box_bottom\":'..esc(box_bottom)",
+    "entry=entry..',\"direction\":'..esc(e.direction)",
+    "entry=entry..',\"force\":'..esc(force_name)..',\"health\":'..esc(health)..'}'",
+    "table.insert(entities_out,entry)",
+    "entities_included=entities_included+1",
+    "end",
+    "end",
+    "local out={}",
+    "table.insert(out,'\"window\":{\"min_x\":'..min_x..',\"min_y\":'..min_y..',\"max_x\":'..max_x..',\"max_y\":'..max_y..'}')",
+    "table.insert(out,'\"tiles\":['..table.concat(tiles_out,',')..']')",
+    "table.insert(out,'\"entities\":['..table.concat(entities_out,',')..']')",
+    "table.insert(out,'\"counts\":{\"tiles_total\":'..tiles_total..',\"tiles_included\":'..tiles_included..',\"entities_total\":'..entities_total..',\"entities_included\":'..entities_included..'}')",
+    "rcon.print('{'..table.concat(out,',')..'}')",
+  ];
+  return parts.join(" ");
+}
+
+function agentPlayerCommand(params: {
+  inventoryLimit: number;
+  equipmentLimit: number;
+}): string {
+  const parts = [
+    "/c",
+    "local player=game.players[1]",
+    "if not player then rcon.print('{\"error\":\"No player\"}') return end",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    `local inv_limit=${params.inventoryLimit}`,
+    `local equip_limit=${params.equipmentLimit}`,
+    "local inventories={}",
+    "local inv_total=0",
+    "local inv_included=0",
+    "local function add_inventory(name,inv)",
+    "if not inv or not inv.valid then return end",
+    "local out={}",
+    "for i=1,#inv do",
+    "inv_total=inv_total+1",
+    "if inv_included < inv_limit then",
+    "local stack=inv[i]",
+    "if stack and stack.valid_for_read then",
+    "local entry='{\"slot\":'..i..',\"name\":'..esc(stack.name)..',\"count\":'..stack.count",
+    "entry=entry..',\"durability\":'..esc(stack.durability)",
+    "entry=entry..',\"ammo\":'..esc(stack.ammo)..'}'",
+    "table.insert(out,entry)",
+    "inv_included=inv_included+1",
+    "end",
+    "end",
+    "if inv_included >= inv_limit then break end",
+    "end",
+    "table.insert(inventories,'{\"name\":'..esc(name)..',\"slots\":['..table.concat(out,',')..']}')",
+    "end",
+    "add_inventory('main',player.get_inventory(defines.inventory.character_main))",
+    "add_inventory('guns',player.get_inventory(defines.inventory.character_guns))",
+    "add_inventory('ammo',player.get_inventory(defines.inventory.character_ammo))",
+    "add_inventory('armor',player.get_inventory(defines.inventory.character_armor))",
+    "add_inventory('trash',player.get_inventory(defines.inventory.character_trash))",
+    "local equipment_out={}",
+    "local equip_total=0",
+    "local equip_included=0",
+    "local armor=player.get_inventory(defines.inventory.character_armor)",
+    "if armor and armor.valid and #armor > 0 then",
+    "local stack=armor[1]",
+    "if stack and stack.valid_for_read then",
+    "local grid=stack.grid",
+    "if grid then",
+    "for _,eq in pairs(grid.equipment) do",
+    "equip_total=equip_total+1",
+    "if equip_included < equip_limit then",
+    "local entry='{\"name\":'..esc(eq.name)..',\"pos_x\":'..eq.position.x..',\"pos_y\":'..eq.position.y",
+    "entry=entry..',\"energy\":'..esc(eq.energy)..'}'",
+    "table.insert(equipment_out,entry)",
+    "equip_included=equip_included+1",
+    "end",
+    "end",
+    "end",
+    "end",
+    "end",
+    "local out={}",
+    "table.insert(out,'\"player\":{')",
+    "table.insert(out,'\"name\":'..esc(player.name))",
+    "table.insert(out,',\"x\":'..esc(player.position.x))",
+    "table.insert(out,',\"y\":'..esc(player.position.y))",
+    "table.insert(out,',\"direction\":'..esc(player.direction))",
+    "table.insert(out,',\"health\":'..esc(player.character and player.character.health))",
+    "table.insert(out,',\"energy\":'..esc(player.character and player.character.energy))",
+    "table.insert(out,',\"inventories\":['..table.concat(inventories,',')..']')",
+    "table.insert(out,',\"equipment\":['..table.concat(equipment_out,',')..']')",
+    "table.insert(out,'}')",
+    "table.insert(out,',\"counts\":{\"inventory_total\":'..inv_total..',\"inventory_included\":'..inv_included..',\"equipment_total\":'..equip_total..',\"equipment_included\":'..equip_included..'}')",
+    "rcon.print('{'..table.concat(out,',')..'}')",
+  ];
+  return parts.join(" ");
+}
+
+function agentResearchCommand(params: { limit: number }): string {
+  const parts = [
+    "/c",
+    "local force=game.forces.player or game.forces[1]",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    `local limit=${params.limit}`,
+    "local available_out={}",
+    "local available_total=0",
+    "local available_included=0",
+    "for name,tech in pairs(force.technologies) do",
+    "if tech.enabled and not tech.researched then",
+    "available_total=available_total+1",
+    "if available_included < limit then",
+    "table.insert(available_out,'{\"name\":'..esc(name)..',\"level\":'..esc(tech.level)..'}')",
+    "available_included=available_included+1",
+    "end",
+    "end",
+    "end",
+    "local queue_out={}",
+    "if force.research_queue and #force.research_queue > 0 then",
+    "for i=1,#force.research_queue do",
+    "local tech=force.research_queue[i]",
+    "table.insert(queue_out,'{\"name\":'..esc(tech.name)..',\"level\":'..esc(tech.level)..'}')",
+    "end",
+    "end",
+    "local current=nil",
+    "if force.current_research then",
+    "local tech=force.current_research",
+    "current='{\"name\":'..esc(tech.name)..',\"level\":'..esc(tech.level)..',\"progress\":'..esc(force.research_progress)..'}'",
+    "end",
+    "local out={}",
+    "table.insert(out,'\"current\":'..(current or 'null'))",
+    "table.insert(out,',\"queue\":['..table.concat(queue_out,',')..']')",
+    "table.insert(out,',\"available\":['..table.concat(available_out,',')..']')",
+    "table.insert(out,',\"counts\":{\"available_total\":'..available_total..',\"available_included\":'..available_included..'}')",
+    "rcon.print('{'..table.concat(out,',')..'}')",
+  ];
+  return parts.join(" ");
+}
+
+function agentRecipesCommand(params: { limit: number; unlockedOnly: boolean }): string {
+  const parts = [
+    "/c",
+    "local force=game.forces.player or game.forces[1]",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    `local limit=${params.limit}`,
+    `local unlocked_only=${params.unlockedOnly ? "true" : "false"}`,
+    "local out={}",
+    "local total=0",
+    "local included=0",
+    "for name,recipe in pairs(force.recipes) do",
+    "if (not unlocked_only) or recipe.enabled then",
+    "total=total+1",
+    "if included < limit then",
+    "local ingredients_out={}",
+    "for _,ing in pairs(recipe.ingredients) do",
+    "table.insert(ingredients_out,'{\"name\":'..esc(ing.name)..',\"amount\":'..esc(ing.amount)..'}')",
+    "end",
+    "local products_out={}",
+    "for _,prod in pairs(recipe.products) do",
+    "table.insert(products_out,'{\"name\":'..esc(prod.name)..',\"amount\":'..esc(prod.amount)..'}')",
+    "end",
+    "local entry='{\"name\":'..esc(name)..',\"enabled\":'..esc(recipe.enabled)",
+    "entry=entry..',\"energy\":'..esc(recipe.energy)..',\"category\":'..esc(recipe.category)",
+    "entry=entry..',\"ingredients\":['..table.concat(ingredients_out,',')..']'",
+    "entry=entry..',\"products\":['..table.concat(products_out,',')..']}'",
+    "table.insert(out,entry)",
+    "included=included+1",
+    "end",
+    "end",
+    "end",
+    "local res={}",
+    "table.insert(res,'\"recipes\":['..table.concat(out,',')..']')",
+    "table.insert(res,',\"counts\":{\"total\":'..total..',\"included\":'..included..'}')",
+    "rcon.print('{'..table.concat(res,',')..'}')",
+  ];
+  return parts.join(" ");
+}
+
+function agentBuildCommand(items: Array<{ name: string; x: number; y: number; direction?: number }>): string {
+  const parts = [
+    "/c",
+    "local s=game.surfaces[1]",
+    "local player=game.players[1]",
+    "local force=player and player.force or game.forces.player or game.forces[1]",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    "local results={}",
+    "local function place(name,x,y,dir)",
+    "local ok,err=pcall(function()",
+    "s.create_entity{ name=name, position={x=x,y=y}, direction=dir, force=force }",
+    "end)",
+    "if ok then return {name=name,x=x,y=y,ok=true} end",
+    "return {name=name,x=x,y=y,ok=false,error=tostring(err)}",
+    "end",
+  ];
+  for (const item of items) {
+    const dir = item.direction ?? 0;
+    parts.push(
+      `table.insert(results,place(${luaString(item.name)},${item.x},${item.y},${dir}))`,
+    );
+  }
+  parts.push(
+    "local out={}",
+    "for i=1,#results do",
+    "local r=results[i]",
+    "local entry='{\"name\":'..esc(r.name)..',\"x\":'..r.x..',\"y\":'..r.y..',\"ok\":'..tostring(r.ok)",
+    "if r.error then entry=entry..',\"error\":'..esc(r.error) end",
+    "entry=entry..'}'",
+    "table.insert(out,entry)",
+    "end",
+    "local results_json='['..table.concat(out,',')..']'",
+    "rcon.print('{\"results\":'..results_json..'}')",
+  );
+  return parts.join(" ");
+}
+
+function agentMineCommand(targets: Array<{ x: number; y: number }>): string {
+  const parts = [
+    "/c",
+    "local s=game.surfaces[1]",
+    "local player=game.players[1]",
+    "if not player then rcon.print('{\"error\":\"No player\"}') return end",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    "local results={}",
+    "local function mine(x,y)",
+    "local ents=s.find_entities_filtered{position={x,y}} or {}",
+    "local e=ents[1]",
+    "if not e then return {x=x,y=y,ok=false,error='no_entity'} end",
+    "local ok,err=pcall(function() player.mine_entity(e) end)",
+    "if ok then return {x=x,y=y,name=e.name,ok=true} end",
+    "return {x=x,y=y,name=e.name,ok=false,error=tostring(err)}",
+    "end",
+  ];
+  for (const target of targets) {
+    parts.push(`table.insert(results,mine(${target.x},${target.y}))`);
+  }
+  parts.push(
+    "local out={}",
+    "for i=1,#results do",
+    "local r=results[i]",
+    "local entry='{\"x\":'..r.x..',\"y\":'..r.y..',\"ok\":'..tostring(r.ok)",
+    "if r.name then entry=entry..',\"name\":'..esc(r.name) end",
+    "if r.error then entry=entry..',\"error\":'..esc(r.error) end",
+    "entry=entry..'}'",
+    "table.insert(out,entry)",
+    "end",
+    "local results_json='['..table.concat(out,',')..']'",
+    "rcon.print('{\"results\":'..results_json..'}')",
+  );
+  return parts.join(" ");
+}
+
+function agentRotateCommand(targets: Array<{ x: number; y: number }>): string {
+  const parts = [
+    "/c",
+    "local s=game.surfaces[1]",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    "local results={}",
+    "local function rotate(x,y)",
+    "local ents=s.find_entities_filtered{position={x,y}} or {}",
+    "local e=ents[1]",
+    "if not e then return {x=x,y=y,ok=false,error='no_entity'} end",
+    "local ok,err=pcall(function() e.rotate() end)",
+    "if ok then return {x=x,y=y,name=e.name,ok=true,direction=e.direction} end",
+    "return {x=x,y=y,name=e.name,ok=false,error=tostring(err)}",
+    "end",
+  ];
+  for (const target of targets) {
+    parts.push(`table.insert(results,rotate(${target.x},${target.y}))`);
+  }
+  parts.push(
+    "local out={}",
+    "for i=1,#results do",
+    "local r=results[i]",
+    "local entry='{\"x\":'..r.x..',\"y\":'..r.y..',\"ok\":'..tostring(r.ok)",
+    "if r.name then entry=entry..',\"name\":'..esc(r.name) end",
+    "if r.direction then entry=entry..',\"direction\":'..esc(r.direction) end",
+    "if r.error then entry=entry..',\"error\":'..esc(r.error) end",
+    "entry=entry..'}'",
+    "table.insert(out,entry)",
+    "end",
+    "local results_json='['..table.concat(out,',')..']'",
+    "rcon.print('{\"results\":'..results_json..'}')",
+  );
+  return parts.join(" ");
+}
+
+function agentSetRecipeCommand(targets: Array<{ x: number; y: number; recipe: string }>): string {
+  const parts = [
+    "/c",
+    "local s=game.surfaces[1]",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    "local results={}",
+    "local function set_recipe(x,y,recipe)",
+    "local ents=s.find_entities_filtered{position={x,y}} or {}",
+    "local e=ents[1]",
+    "if not e then return {x=x,y=y,ok=false,error='no_entity'} end",
+    "local ok,err=pcall(function() e.set_recipe(recipe) end)",
+    "if ok then return {x=x,y=y,name=e.name,ok=true,recipe=recipe} end",
+    "return {x=x,y=y,name=e.name,ok=false,error=tostring(err)}",
+    "end",
+  ];
+  for (const target of targets) {
+    parts.push(
+      `table.insert(results,set_recipe(${target.x},${target.y},${luaString(
+        target.recipe,
+      )}))`,
+    );
+  }
+  parts.push(
+    "local out={}",
+    "for i=1,#results do",
+    "local r=results[i]",
+    "local entry='{\"x\":'..r.x..',\"y\":'..r.y..',\"ok\":'..tostring(r.ok)",
+    "if r.name then entry=entry..',\"name\":'..esc(r.name) end",
+    "if r.recipe then entry=entry..',\"recipe\":'..esc(r.recipe) end",
+    "if r.error then entry=entry..',\"error\":'..esc(r.error) end",
+    "entry=entry..'}'",
+    "table.insert(out,entry)",
+    "end",
+    "local results_json='['..table.concat(out,',')..']'",
+    "rcon.print('{\"results\":'..results_json..'}')",
+  );
+  return parts.join(" ");
+}
+
+function agentCraftCommand(recipe: string, count: number): string {
+  const parts = [
+    "/c",
+    "local player=game.players[1]",
+    "if not player then rcon.print('{\"error\":\"No player\"}') return end",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    `local recipe=${luaString(recipe)}`,
+    `local count=${count}`,
+    "local ok,err=pcall(function() player.begin_crafting{recipe=recipe,count=count} end)",
+    "local out={}",
+    "table.insert(out,'\"recipe\":'..esc(recipe))",
+    "table.insert(out,',\"count\":'..esc(count))",
+    "table.insert(out,',\"ok\":'..tostring(ok))",
+    "if err then table.insert(out,',\"error\":'..esc(tostring(err))) end",
+    "rcon.print('{'..table.concat(out,',')..'}')",
+  ];
+  return parts.join(" ");
+}
+
+function agentInsertCommand(params: {
+  x: number;
+  y: number;
+  item: string;
+  count: number;
+}): string {
+  const parts = [
+    "/c",
+    "local s=game.surfaces[1]",
+    "local player=game.players[1]",
+    "if not player then rcon.print('{\"ok\":false,\"error\":\"No player\"}') return end",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    `local x=${params.x}`,
+    `local y=${params.y}`,
+    `local item=${luaString(params.item)}`,
+    `local count=${params.count}`,
+    "local ents=s.find_entities_filtered{position={x,y}} or {}",
+    "local e=ents[1]",
+    "if not e then rcon.print('{\"ok\":false,\"error\":\"no_entity\"}') return end",
+    "local removed=player.remove_item{name=item,count=count}",
+    "local inserted=e.insert{name=item,count=removed}",
+    "if inserted < removed then player.insert{name=item,count=removed-inserted} end",
+    "local out={}",
+    "table.insert(out,'\"ok\":true')",
+    "table.insert(out,',\"removed\":'..esc(removed))",
+    "table.insert(out,',\"inserted\":'..esc(inserted))",
+    "rcon.print('{'..table.concat(out,',')..'}')",
+  ];
+  return parts.join(" ");
+}
+
+function agentExtractCommand(params: {
+  x: number;
+  y: number;
+  item: string;
+  count: number;
+}): string {
+  const parts = [
+    "/c",
+    "local s=game.surfaces[1]",
+    "local player=game.players[1]",
+    "if not player then rcon.print('{\"ok\":false,\"error\":\"No player\"}') return end",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    `local x=${params.x}`,
+    `local y=${params.y}`,
+    `local item=${luaString(params.item)}`,
+    `local count=${params.count}`,
+    "local ents=s.find_entities_filtered{position={x,y}} or {}",
+    "local e=ents[1]",
+    "if not e then rcon.print('{\"ok\":false,\"error\":\"no_entity\"}') return end",
+    "local removed=e.remove_item{name=item,count=count}",
+    "local inserted=player.insert{name=item,count=removed}",
+    "local out={}",
+    "table.insert(out,'\"ok\":true')",
+    "table.insert(out,',\"removed\":'..esc(removed))",
+    "table.insert(out,',\"inserted\":'..esc(inserted))",
     "rcon.print('{'..table.concat(out,',')..'}')",
   ];
   return parts.join(" ");
@@ -650,6 +1248,435 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     }
   }
 
+  if (req.method === "POST" && url.pathname === "/api/agent/observe/world") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const window = body?.window || {};
+    const include: string[] = Array.isArray(body?.include)
+      ? body.include
+      : ["tiles", "entities"];
+    const includeTiles = include.includes("tiles");
+    const includeEntities = include.includes("entities");
+    const radius = clampInt(window.radius, AGENT_DEFAULT_RADIUS, 1, 200);
+    const x = clampInt(window.x, 0, -1000000, 1000000);
+    const y = clampInt(window.y, 0, -1000000, 1000000);
+    const limits = body?.limits || {};
+    const tileLimit = clampInt(limits.tiles, AGENT_MAX_TILES, 1, AGENT_MAX_TILES);
+    const entityLimit = clampInt(
+      limits.entities,
+      AGENT_MAX_ENTITIES,
+      1,
+      AGENT_MAX_ENTITIES,
+    );
+    try {
+      const response = await rconCommand(
+        agentWorldCommand({
+          x,
+          y,
+          radius,
+          includeTiles,
+          includeEntities,
+          tileLimit,
+          entityLimit,
+        }),
+      );
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      const counts = data?.counts || {};
+      const truncated =
+        (includeTiles && counts.tiles_included < counts.tiles_total) ||
+        (includeEntities && counts.entities_included < counts.entities_total);
+      return json(res, 200, {
+        ok: true,
+        data,
+        truncated,
+      });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/observe/player") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const limits = body?.limits || {};
+    const inventoryLimit = clampInt(
+      limits.inventory_slots,
+      AGENT_MAX_INVENTORY_SLOTS,
+      1,
+      AGENT_MAX_INVENTORY_SLOTS,
+    );
+    const equipmentLimit = clampInt(
+      limits.equipment_slots,
+      AGENT_MAX_EQUIPMENT_SLOTS,
+      1,
+      AGENT_MAX_EQUIPMENT_SLOTS,
+    );
+    try {
+      const response = await rconCommand(
+        agentPlayerCommand({ inventoryLimit, equipmentLimit }),
+      );
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      const counts = data?.counts || {};
+      const truncated =
+        counts.inventory_included < counts.inventory_total ||
+        counts.equipment_included < counts.equipment_total;
+      return json(res, 200, { ok: true, data, truncated });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/observe/research") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const limits = body?.limits || {};
+    const limit = clampInt(limits.available, AGENT_MAX_RESEARCH, 1, AGENT_MAX_RESEARCH);
+    try {
+      const response = await rconCommand(agentResearchCommand({ limit }));
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      const counts = data?.counts || {};
+      const truncated = counts.available_included < counts.available_total;
+      return json(res, 200, { ok: true, data, truncated });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/observe/recipes") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const limits = body?.limits || {};
+    const limit = clampInt(limits.recipes, AGENT_MAX_RECIPES, 1, AGENT_MAX_RECIPES);
+    const filters = body?.filters || {};
+    const unlockedOnly = Boolean(filters.unlocked);
+    try {
+      const response = await rconCommand(
+        agentRecipesCommand({ limit, unlockedOnly }),
+      );
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      const counts = data?.counts || {};
+      const truncated = counts.included < counts.total;
+      return json(res, 200, { ok: true, data, truncated });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/act/build") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const entities: any[] = Array.isArray(body?.entities) ? body.entities : [];
+    const limits = body?.limits || {};
+    const max = clampInt(limits.max, AGENT_MAX_ACTIONS, 1, AGENT_MAX_ACTIONS);
+    const trimmed = entities.slice(0, max).filter((e) => e?.name && e?.x !== undefined && e?.y !== undefined);
+    try {
+      const response = await rconCommand(agentBuildCommand(trimmed));
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, {
+        ok: true,
+        data,
+        truncated: entities.length > trimmed.length,
+      });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/act/mine") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const targets: any[] = Array.isArray(body?.targets) ? body.targets : [];
+    const limits = body?.limits || {};
+    const max = clampInt(limits.max, AGENT_MAX_ACTIONS, 1, AGENT_MAX_ACTIONS);
+    const trimmed = targets.slice(0, max).filter((t) => t?.x !== undefined && t?.y !== undefined);
+    try {
+      const response = await rconCommand(agentMineCommand(trimmed));
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, {
+        ok: true,
+        data,
+        truncated: targets.length > trimmed.length,
+      });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/act/rotate") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const targets: any[] = Array.isArray(body?.targets) ? body.targets : [];
+    const limits = body?.limits || {};
+    const max = clampInt(limits.max, AGENT_MAX_ACTIONS, 1, AGENT_MAX_ACTIONS);
+    const trimmed = targets.slice(0, max).filter((t) => t?.x !== undefined && t?.y !== undefined);
+    try {
+      const response = await rconCommand(agentRotateCommand(trimmed));
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, {
+        ok: true,
+        data,
+        truncated: targets.length > trimmed.length,
+      });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/act/set-recipe") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const targets: any[] = Array.isArray(body?.targets) ? body.targets : [];
+    const limits = body?.limits || {};
+    const max = clampInt(limits.max, AGENT_MAX_ACTIONS, 1, AGENT_MAX_ACTIONS);
+    const trimmed = targets
+      .slice(0, max)
+      .filter((t) => t?.x !== undefined && t?.y !== undefined && t?.recipe);
+    try {
+      const response = await rconCommand(agentSetRecipeCommand(trimmed));
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, {
+        ok: true,
+        data,
+        truncated: targets.length > trimmed.length,
+      });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/act/craft") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const recipe = body?.item || body?.recipe;
+    const count = clampInt(body?.count, 1, 1, 10000);
+    if (!recipe || typeof recipe !== "string") {
+      return json(res, 400, { error: "Missing recipe" });
+    }
+    try {
+      const response = await rconCommand(agentCraftCommand(recipe, count));
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, { ok: true, data });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/act/insert") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const to = body?.to?.entity || body?.entity || {};
+    const item = body?.item;
+    const count = clampInt(body?.count, 1, 1, 100000);
+    if (!item || typeof item !== "string") {
+      return json(res, 400, { error: "Missing item" });
+    }
+    if (to?.x === undefined || to?.y === undefined) {
+      return json(res, 400, { error: "Missing target" });
+    }
+    try {
+      const response = await rconCommand(
+        agentInsertCommand({ x: Number(to.x), y: Number(to.y), item, count }),
+      );
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, { ok: true, data });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/act/extract") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const from = body?.from?.entity || body?.entity || {};
+    const item = body?.item;
+    const count = clampInt(body?.count, 1, 1, 100000);
+    if (!item || typeof item !== "string") {
+      return json(res, 400, { error: "Missing item" });
+    }
+    if (from?.x === undefined || from?.y === undefined) {
+      return json(res, 400, { error: "Missing target" });
+    }
+    try {
+      const response = await rconCommand(
+        agentExtractCommand({
+          x: Number(from.x),
+          y: Number(from.y),
+          item,
+          count,
+        }),
+      );
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, { ok: true, data });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
   if (req.method === "POST" && url.pathname === "/api/rcon/command") {
     let body: any = null;
     try {
@@ -717,14 +1744,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       "server-adminlist.json",
     );
     const args = [
-      // "--start-server",
-      // savePath,
+      "--start-server",
+      savePath,
       "--server-settings",
       settingsPath,
       "--server-adminlist",
       adminlistPath,
-      "--start-server-load-scenario",
-      "default_lab_scenario",
+      // Uncomment this and comment --start-server to load the default lab scenario
+      // "--start-server-load-scenario",
+      // "default_lab_scenario",
     ];
     if (rconConfigured()) {
       args.push(
