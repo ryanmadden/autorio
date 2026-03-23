@@ -10,8 +10,7 @@
     "agent": "node dist/agent-cli.js"
   },
   "bin": {
-    "factorio": "dist/agent-cli.js",
-    "factorio-agent": "dist/agent-cli.js"
+    "factorio": "dist/agent-cli.js"
   },
   "dependencies": {},
   "devDependencies": {

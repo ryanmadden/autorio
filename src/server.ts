@@ -46,8 +46,6 @@ const RCON_PASSWORD = process.env.RCON_PASSWORD || "";
 const RCON_AUTH_ID = 0x1234;
 
 const AGENT_DEFAULT_RADIUS = 12;
-const AGENT_MAX_TILES = 625;
-const AGENT_MAX_ENTITIES = 200;
 const AGENT_MAX_INVENTORY_SLOTS = 200;
 const AGENT_MAX_EQUIPMENT_SLOTS = 50;
 const AGENT_MAX_RECIPES = 300;
@@ -194,7 +192,7 @@ function rconStatus(): RconStatus {
 
 function worldInfoCommand(): string {
   const parts = [
-    "/c",
+    "/sc",
     "local s=game.surfaces[1]",
     "local function safe(get)",
     "local ok,val=pcall(get)",
@@ -279,7 +277,7 @@ function worldInfoCommand(): string {
 
 function placeTestItemsCommand(): string {
   const parts = [
-    "/c",
+    "/sc",
     "local s=game.surfaces[1]",
     "local force=game.forces.player or game.forces[1]",
     "local function place(name,x,y)",
@@ -331,7 +329,7 @@ function clampInt(value: unknown, fallback: number, min: number, max: number) {
 }
 
 function luaString(value: string) {
-  return `"${value.replace(/\\\\/g, "\\\\\\\\").replace(/\"/g, "\\\\\"")}"`;
+  return `"${value.replace(/\\\\/g, "\\\\\\\\").replace(/\"/g, '\\\\"')}"`;
 }
 
 function agentWorldCommand(params: {
@@ -340,15 +338,13 @@ function agentWorldCommand(params: {
   radius: number;
   includeTiles: boolean;
   includeEntities: boolean;
-  tileLimit: number;
-  entityLimit: number;
 }): string {
   const minX = params.x - params.radius;
   const maxX = params.x + params.radius;
   const minY = params.y - params.radius;
   const maxY = params.y + params.radius;
   const parts = [
-    "/c",
+    "/sc",
     "local s=game.surfaces[1]",
     "local function esc(v)",
     "if v==nil then return 'null' end",
@@ -365,8 +361,6 @@ function agentWorldCommand(params: {
     `local max_x=${maxX}`,
     `local min_y=${minY}`,
     `local max_y=${maxY}`,
-    `local tile_limit=${params.tileLimit}`,
-    `local entity_limit=${params.entityLimit}`,
     "local tiles_out={}",
     "local tiles_total=0",
     "local tiles_included=0",
@@ -376,11 +370,9 @@ function agentWorldCommand(params: {
     "for y=min_y,max_y do",
     "for x=min_x,max_x do",
     "tiles_total=tiles_total+1",
-    "if tiles_included < tile_limit then",
     "local t=s.get_tile(x,y)",
     "table.insert(tiles_out,'{\"x\":'..x..',\"y\":'..y..',\"name\":'..esc(t.name)..'}')",
     "tiles_included=tiles_included+1",
-    "end",
     "end",
     "end",
     "end",
@@ -393,7 +385,6 @@ function agentWorldCommand(params: {
     "local entities=s.find_entities_filtered{area={{min_x,min_y},{max_x+1,max_y+1}}} or {}",
     "entities_total=#entities",
     "for i=1,#entities do",
-    "if entities_included >= entity_limit then break end",
     "local e=entities[i]",
     "local force_name=e.force and e.force.name or nil",
     "local health=e.health",
@@ -436,9 +427,9 @@ function agentPlayerCommand(params: {
   equipmentLimit: number;
 }): string {
   const parts = [
-    "/c",
+    "/sc",
     "local player=game.players[1]",
-    "if not player then rcon.print('{\"error\":\"No player\"}') return end",
+    'if not player then rcon.print(\'{"error":"No player"}\') return end',
     "local function esc(v)",
     "if v==nil then return 'null' end",
     "local t=type(v)",
@@ -463,9 +454,15 @@ function agentPlayerCommand(params: {
     "if inv_included < inv_limit then",
     "local stack=inv[i]",
     "if stack and stack.valid_for_read then",
+    "local durability=nil",
+    "local ammo=nil",
+    "local ok_dur, dur=pcall(function() return stack.durability end)",
+    "if ok_dur then durability=dur end",
+    "local ok_ammo, am=pcall(function() return stack.ammo end)",
+    "if ok_ammo then ammo=am end",
     "local entry='{\"slot\":'..i..',\"name\":'..esc(stack.name)..',\"count\":'..stack.count",
-    "entry=entry..',\"durability\":'..esc(stack.durability)",
-    "entry=entry..',\"ammo\":'..esc(stack.ammo)..'}'",
+    "entry=entry..',\"durability\":'..esc(durability)",
+    "entry=entry..',\"ammo\":'..esc(ammo)..'}'",
     "table.insert(out,entry)",
     "inv_included=inv_included+1",
     "end",
@@ -505,7 +502,9 @@ function agentPlayerCommand(params: {
     "table.insert(out,'\"name\":'..esc(player.name))",
     "table.insert(out,',\"x\":'..esc(player.position.x))",
     "table.insert(out,',\"y\":'..esc(player.position.y))",
-    "table.insert(out,',\"direction\":'..esc(player.direction))",
+    "local direction=nil",
+    "if player.character then direction=player.character.direction end",
+    "table.insert(out,',\"direction\":'..esc(direction))",
     "table.insert(out,',\"health\":'..esc(player.character and player.character.health))",
     "table.insert(out,',\"energy\":'..esc(player.character and player.character.energy))",
     "table.insert(out,',\"inventories\":['..table.concat(inventories,',')..']')",
@@ -519,7 +518,7 @@ function agentPlayerCommand(params: {
 
 function agentResearchCommand(params: { limit: number }): string {
   const parts = [
-    "/c",
+    "/sc",
     "local force=game.forces.player or game.forces[1]",
     "local function esc(v)",
     "if v==nil then return 'null' end",
@@ -537,11 +536,17 @@ function agentResearchCommand(params: { limit: number }): string {
     "local available_total=0",
     "local available_included=0",
     "for name,tech in pairs(force.technologies) do",
-    "if tech.enabled and not tech.researched then",
+    "if tech.enabled and not tech.researched and #tech.research_unit_ingredients > 0 then",
+    "local prereqs_met=true",
+    "for _,p in pairs(tech.prerequisites) do",
+    "if not p.researched then prereqs_met=false break end",
+    "end",
+    "if prereqs_met then",
     "available_total=available_total+1",
     "if available_included < limit then",
     "table.insert(available_out,'{\"name\":'..esc(name)..',\"level\":'..esc(tech.level)..'}')",
     "available_included=available_included+1",
+    "end",
     "end",
     "end",
     "end",
@@ -559,17 +564,20 @@ function agentResearchCommand(params: { limit: number }): string {
     "end",
     "local out={}",
     "table.insert(out,'\"current\":'..(current or 'null'))",
-    "table.insert(out,',\"queue\":['..table.concat(queue_out,',')..']')",
-    "table.insert(out,',\"available\":['..table.concat(available_out,',')..']')",
-    "table.insert(out,',\"counts\":{\"available_total\":'..available_total..',\"available_included\":'..available_included..'}')",
+    "table.insert(out,'\"queue\":['..table.concat(queue_out,',')..']')",
+    "table.insert(out,'\"available\":['..table.concat(available_out,',')..']')",
+    "table.insert(out,'\"counts\":{\"available_total\":'..available_total..',\"available_included\":'..available_included..'}')",
     "rcon.print('{'..table.concat(out,',')..'}')",
   ];
   return parts.join(" ");
 }
 
-function agentRecipesCommand(params: { limit: number; unlockedOnly: boolean }): string {
+function agentRecipesCommand(params: {
+  limit: number;
+  unlockedOnly: boolean;
+}): string {
   const parts = [
-    "/c",
+    "/sc",
     "local force=game.forces.player or game.forces[1]",
     "local function esc(v)",
     "if v==nil then return 'null' end",
@@ -610,15 +618,17 @@ function agentRecipesCommand(params: { limit: number; unlockedOnly: boolean }): 
     "end",
     "local res={}",
     "table.insert(res,'\"recipes\":['..table.concat(out,',')..']')",
-    "table.insert(res,',\"counts\":{\"total\":'..total..',\"included\":'..included..'}')",
+    "table.insert(res,'\"counts\":{\"total\":'..total..',\"included\":'..included..'}')",
     "rcon.print('{'..table.concat(res,',')..'}')",
   ];
   return parts.join(" ");
 }
 
-function agentBuildCommand(items: Array<{ name: string; x: number; y: number; direction?: number }>): string {
+function agentBuildCommand(
+  items: Array<{ name: string; x: number; y: number; direction?: number }>,
+): string {
   const parts = [
-    "/c",
+    "/sc",
     "local s=game.surfaces[1]",
     "local player=game.players[1]",
     "local force=player and player.force or game.forces.player or game.forces[1]",
@@ -635,6 +645,8 @@ function agentBuildCommand(items: Array<{ name: string; x: number; y: number; di
     "end",
     "local results={}",
     "local function place(name,x,y,dir)",
+    "local can=s.can_place_entity{name=name,position={x=x,y=y},direction=dir,force=force}",
+    "if not can then return {name=name,x=x,y=y,ok=false,error='Placement blocked: collision or invalid position'} end",
     "local ok,err=pcall(function()",
     "s.create_entity{ name=name, position={x=x,y=y}, direction=dir, force=force }",
     "end)",
@@ -665,10 +677,10 @@ function agentBuildCommand(items: Array<{ name: string; x: number; y: number; di
 
 function agentMineCommand(targets: Array<{ x: number; y: number }>): string {
   const parts = [
-    "/c",
+    "/sc",
     "local s=game.surfaces[1]",
     "local player=game.players[1]",
-    "if not player then rcon.print('{\"error\":\"No player\"}') return end",
+    'if not player then rcon.print(\'{"error":"No player"}\') return end',
     "local function esc(v)",
     "if v==nil then return 'null' end",
     "local t=type(v)",
@@ -681,13 +693,24 @@ function agentMineCommand(targets: Array<{ x: number; y: number }>): string {
     "end",
     "end",
     "local results={}",
-    "local function mine(x,y)",
+    "local function find_entity(x,y)",
     "local ents=s.find_entities_filtered{position={x,y}} or {}",
-    "local e=ents[1]",
+    "if #ents > 0 then return ents[1] end",
+    "local area={{x-0.5,y-0.5},{x+0.5,y+0.5}}",
+    "ents=s.find_entities_filtered{area=area} or {}",
+    "for i=1,#ents do",
+    "local cand=ents[i]",
+    "if cand and cand.valid and cand.minable then return cand end",
+    "end",
+    "return nil",
+    "end",
+    "local function mine(x,y)",
+    "local e=find_entity(x,y)",
     "if not e then return {x=x,y=y,ok=false,error='no_entity'} end",
+    "local ename=e.name",
     "local ok,err=pcall(function() player.mine_entity(e) end)",
-    "if ok then return {x=x,y=y,name=e.name,ok=true} end",
-    "return {x=x,y=y,name=e.name,ok=false,error=tostring(err)}",
+    "if ok then return {x=x,y=y,name=ename,ok=true} end",
+    "return {x=x,y=y,name=ename,ok=false,error=tostring(err)}",
     "end",
   ];
   for (const target of targets) {
@@ -711,7 +734,7 @@ function agentMineCommand(targets: Array<{ x: number; y: number }>): string {
 
 function agentRotateCommand(targets: Array<{ x: number; y: number }>): string {
   const parts = [
-    "/c",
+    "/sc",
     "local s=game.surfaces[1]",
     "local function esc(v)",
     "if v==nil then return 'null' end",
@@ -754,9 +777,11 @@ function agentRotateCommand(targets: Array<{ x: number; y: number }>): string {
   return parts.join(" ");
 }
 
-function agentSetRecipeCommand(targets: Array<{ x: number; y: number; recipe: string }>): string {
+function agentSetRecipeCommand(
+  targets: Array<{ x: number; y: number; recipe: string }>,
+): string {
   const parts = [
-    "/c",
+    "/sc",
     "local s=game.surfaces[1]",
     "local function esc(v)",
     "if v==nil then return 'null' end",
@@ -803,11 +828,68 @@ function agentSetRecipeCommand(targets: Array<{ x: number; y: number; recipe: st
   return parts.join(" ");
 }
 
+function agentResearchStartCommand(technology: string): string {
+  const parts = [
+    "/sc",
+    "local force=game.forces.player or game.forces[1]",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    `local tech_name=${luaString(technology)}`,
+    "local tech=force.technologies[tech_name]",
+    "if not tech then",
+    "rcon.print('{\"ok\":false,\"error\":'..esc('Technology not found: '..tech_name)..'}')",
+    "return",
+    "end",
+    "if tech.researched then",
+    "rcon.print('{\"ok\":false,\"error\":'..esc('Already researched: '..tech_name)..'}')",
+    "return",
+    "end",
+    "if not tech.enabled then",
+    "rcon.print('{\"ok\":false,\"error\":'..esc('Technology not available: '..tech_name)..'}')",
+    "return",
+    "end",
+    "if #tech.research_unit_ingredients == 0 then",
+    "rcon.print('{\"ok\":false,\"error\":'..esc('Trigger technology (completed by in-game action, not research): '..tech_name)..'}')",
+    "return",
+    "end",
+    "for _,p in pairs(tech.prerequisites) do",
+    "if not p.researched then",
+    "rcon.print('{\"ok\":false,\"error\":'..esc('Missing prerequisite: '..p.name)..'}')",
+    "return",
+    "end",
+    "end",
+    "local added=force.add_research(tech)",
+    "if not added then",
+    "rcon.print('{\"ok\":false,\"error\":'..esc('Failed to add research: '..tech_name)..'}')",
+    "return",
+    "end",
+    "local out={}",
+    "table.insert(out,'\"ok\":true')",
+    "table.insert(out,'\"technology\":'..esc(tech.name))",
+    "table.insert(out,'\"level\":'..esc(tech.level))",
+    "if force.current_research then",
+    "local cr=force.current_research",
+    "table.insert(out,'\"current_research\":{\"name\":'..esc(cr.name)..',\"level\":'..esc(cr.level)..',\"progress\":'..esc(force.research_progress)..'}')",
+    "end",
+    "rcon.print('{'..table.concat(out,',')..'}')",
+  ];
+  return parts.join(" ");
+}
+
 function agentCraftCommand(recipe: string, count: number): string {
   const parts = [
-    "/c",
+    "/sc",
     "local player=game.players[1]",
-    "if not player then rcon.print('{\"error\":\"No player\"}') return end",
+    'if not player then rcon.print(\'{"error":"No player"}\') return end',
     "local function esc(v)",
     "if v==nil then return 'null' end",
     "local t=type(v)",
@@ -821,6 +903,17 @@ function agentCraftCommand(recipe: string, count: number): string {
     "end",
     `local recipe=${luaString(recipe)}`,
     `local count=${count}`,
+    "local craftable=player.get_craftable_count(recipe)",
+    "if craftable < count then",
+    "local out={}",
+    "table.insert(out,'\"recipe\":'..esc(recipe))",
+    "table.insert(out,',\"count\":'..esc(count))",
+    "table.insert(out,',\"craftable\":'..esc(craftable))",
+    "table.insert(out,',\"ok\":false')",
+    "table.insert(out,',\"error\":'..esc('Insufficient ingredients'))",
+    "rcon.print('{'..table.concat(out,',')..'}')",
+    "return",
+    "end",
     "local ok,err=pcall(function() player.begin_crafting{recipe=recipe,count=count} end)",
     "local out={}",
     "table.insert(out,'\"recipe\":'..esc(recipe))",
@@ -839,10 +932,10 @@ function agentInsertCommand(params: {
   count: number;
 }): string {
   const parts = [
-    "/c",
+    "/sc",
     "local s=game.surfaces[1]",
     "local player=game.players[1]",
-    "if not player then rcon.print('{\"ok\":false,\"error\":\"No player\"}') return end",
+    'if not player then rcon.print(\'{"ok":false,"error":"No player"}\') return end',
     "local function esc(v)",
     "if v==nil then return 'null' end",
     "local t=type(v)",
@@ -860,7 +953,7 @@ function agentInsertCommand(params: {
     `local count=${params.count}`,
     "local ents=s.find_entities_filtered{position={x,y}} or {}",
     "local e=ents[1]",
-    "if not e then rcon.print('{\"ok\":false,\"error\":\"no_entity\"}') return end",
+    'if not e then rcon.print(\'{"ok":false,"error":"no_entity"}\') return end',
     "local removed=player.remove_item{name=item,count=count}",
     "local inserted=e.insert{name=item,count=removed}",
     "if inserted < removed then player.insert{name=item,count=removed-inserted} end",
@@ -880,10 +973,10 @@ function agentExtractCommand(params: {
   count: number;
 }): string {
   const parts = [
-    "/c",
+    "/sc",
     "local s=game.surfaces[1]",
     "local player=game.players[1]",
-    "if not player then rcon.print('{\"ok\":false,\"error\":\"No player\"}') return end",
+    'if not player then rcon.print(\'{"ok":false,"error":"No player"}\') return end',
     "local function esc(v)",
     "if v==nil then return 'null' end",
     "local t=type(v)",
@@ -901,7 +994,17 @@ function agentExtractCommand(params: {
     `local count=${params.count}`,
     "local ents=s.find_entities_filtered{position={x,y}} or {}",
     "local e=ents[1]",
-    "if not e then rcon.print('{\"ok\":false,\"error\":\"no_entity\"}') return end",
+    'if not e then rcon.print(\'{"ok":false,"error":"no_entity"}\') return end',
+    "local available=e.get_item_count(item) or 0",
+    "if available < count then",
+    "local out={}",
+    "table.insert(out,'\"ok\":false')",
+    "table.insert(out,',\"error\":'..esc('count too high: requested '..count..' but only '..available..' available'))",
+    "table.insert(out,',\"available\":'..esc(available))",
+    "table.insert(out,',\"requested\":'..esc(count))",
+    "rcon.print('{'..table.concat(out,',')..'}')",
+    "return",
+    "end",
     "local removed=e.remove_item{name=item,count=count}",
     "local inserted=player.insert{name=item,count=removed}",
     "local out={}",
@@ -1270,14 +1373,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     const radius = clampInt(window.radius, AGENT_DEFAULT_RADIUS, 1, 200);
     const x = clampInt(window.x, 0, -1000000, 1000000);
     const y = clampInt(window.y, 0, -1000000, 1000000);
-    const limits = body?.limits || {};
-    const tileLimit = clampInt(limits.tiles, AGENT_MAX_TILES, 1, AGENT_MAX_TILES);
-    const entityLimit = clampInt(
-      limits.entities,
-      AGENT_MAX_ENTITIES,
-      1,
-      AGENT_MAX_ENTITIES,
-    );
     try {
       const response = await rconCommand(
         agentWorldCommand({
@@ -1286,8 +1381,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
           radius,
           includeTiles,
           includeEntities,
-          tileLimit,
-          entityLimit,
         }),
       );
       let data: any = response;
@@ -1370,7 +1463,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       return json(res, 409, { error: "RCON not connected" });
     }
     const limits = body?.limits || {};
-    const limit = clampInt(limits.available, AGENT_MAX_RESEARCH, 1, AGENT_MAX_RESEARCH);
+    const limit = clampInt(
+      limits.available,
+      AGENT_MAX_RESEARCH,
+      1,
+      AGENT_MAX_RESEARCH,
+    );
     try {
       const response = await rconCommand(agentResearchCommand({ limit }));
       let data: any = response;
@@ -1401,7 +1499,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       return json(res, 409, { error: "RCON not connected" });
     }
     const limits = body?.limits || {};
-    const limit = clampInt(limits.recipes, AGENT_MAX_RECIPES, 1, AGENT_MAX_RECIPES);
+    const limit = clampInt(
+      limits.recipes,
+      AGENT_MAX_RECIPES,
+      1,
+      AGENT_MAX_RECIPES,
+    );
     const filters = body?.filters || {};
     const unlockedOnly = Boolean(filters.unlocked);
     try {
@@ -1438,7 +1541,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     const entities: any[] = Array.isArray(body?.entities) ? body.entities : [];
     const limits = body?.limits || {};
     const max = clampInt(limits.max, AGENT_MAX_ACTIONS, 1, AGENT_MAX_ACTIONS);
-    const trimmed = entities.slice(0, max).filter((e) => e?.name && e?.x !== undefined && e?.y !== undefined);
+    const trimmed = entities
+      .slice(0, max)
+      .filter((e) => e?.name && e?.x !== undefined && e?.y !== undefined);
     try {
       const response = await rconCommand(agentBuildCommand(trimmed));
       let data: any = response;
@@ -1473,7 +1578,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     const targets: any[] = Array.isArray(body?.targets) ? body.targets : [];
     const limits = body?.limits || {};
     const max = clampInt(limits.max, AGENT_MAX_ACTIONS, 1, AGENT_MAX_ACTIONS);
-    const trimmed = targets.slice(0, max).filter((t) => t?.x !== undefined && t?.y !== undefined);
+    const trimmed = targets
+      .slice(0, max)
+      .filter((t) => t?.x !== undefined && t?.y !== undefined);
     try {
       const response = await rconCommand(agentMineCommand(trimmed));
       let data: any = response;
@@ -1508,7 +1615,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     const targets: any[] = Array.isArray(body?.targets) ? body.targets : [];
     const limits = body?.limits || {};
     const max = clampInt(limits.max, AGENT_MAX_ACTIONS, 1, AGENT_MAX_ACTIONS);
-    const trimmed = targets.slice(0, max).filter((t) => t?.x !== undefined && t?.y !== undefined);
+    const trimmed = targets
+      .slice(0, max)
+      .filter((t) => t?.x !== undefined && t?.y !== undefined);
     try {
       const response = await rconCommand(agentRotateCommand(trimmed));
       let data: any = response;
@@ -1590,6 +1699,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       } catch {
         // Leave as raw string if it isn't JSON.
       }
+      if (data && typeof data === "object" && data.ok === false) {
+        return json(res, 400, {
+          error: data?.error || "Extract failed",
+          data,
+        });
+      }
       return json(res, 200, { ok: true, data });
     } catch (err: any) {
       return json(res, 500, { error: err?.message || "RCON command failed" });
@@ -1670,6 +1785,42 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
         data = JSON.parse(response);
       } catch {
         // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, { ok: true, data });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/act/research") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const technology = body?.technology;
+    if (!technology || typeof technology !== "string") {
+      return json(res, 400, { error: "Missing technology" });
+    }
+    try {
+      const response = await rconCommand(
+        agentResearchStartCommand(technology),
+      );
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      if (data && typeof data === "object" && data.ok === false) {
+        return json(res, 400, { error: data?.error || "Research failed", data });
       }
       return json(res, 200, { ok: true, data });
     } catch (err: any) {

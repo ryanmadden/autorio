@@ -22,8 +22,17 @@ function writeResponse(resp: ResponseShape) {
   process.stdout.write(`${JSON.stringify(resp)}\n`);
 }
 
+function parseJsonIfString(value: unknown) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
 function usageGlobal() {
-  return `factorio-agent <command> [options]
+  return `factorio <command> [options]
 
 Commands:
   server-status
@@ -38,6 +47,7 @@ Commands:
   act-mine --target x,y [--target ...] [--targets-json <json>]
   act-rotate --target x,y [--target ...] [--targets-json <json>]
   act-set-recipe --target x,y,recipe [--target ...] [--targets-json <json>]
+  act-research --technology <name>
   act-craft --item <name> --count <n>
   act-insert --entity x,y --item <name> --count <n>
   act-extract --entity x,y --item <name> --count <n>
@@ -46,66 +56,105 @@ Commands:
 Global options:
   --base <url> (default: FACTORIO_API_BASE or http://localhost:3000)
   --help
+
+More help:
+  Run: factorio <command> --help
 `;
 }
 
 function usageForCommand(command: string | null) {
   switch (command) {
     case "server-status":
-      return "Usage: factorio-agent server-status\n";
+      return (
+        "server-status: Show whether the server is running and RCON is connected.\n" +
+        "Usage: factorio server-status\n"
+      );
     case "server-start":
-      return "Usage: factorio-agent server-start --save <name>.zip\n";
+      return (
+        "server-start: Launch the headless server with the given save.\n" +
+        "Usage: factorio server-start --save <name>.zip\n"
+      );
     case "server-stop":
-      return "Usage: factorio-agent server-stop\n";
+      return (
+        "server-stop: Stop the running server (saves and exits).\n" +
+        "Usage: factorio server-stop\n"
+      );
     case "server-saves":
-      return "Usage: factorio-agent server-saves\n";
+      return (
+        "server-saves: List available save files on the server.\n" +
+        "Usage: factorio server-saves\n"
+      );
     case "observe-world":
       return (
-        "Usage: factorio-agent observe-world --window-x <n> --window-y <n> --radius <n> --include tiles,entities\n" +
-        "Options: --limit-tiles <n> --limit-entities <n>\n"
+        "observe-world: Fetch tiles/entities in a window around a target position.\n" +
+        "Usage: factorio observe-world --window-x <n> --window-y <n> --radius <n> --include tiles,entities\n"
       );
     case "observe-player":
       return (
-        "Usage: factorio-agent observe-player --limit-inventory <n> --limit-equipment <n>\n"
+        "observe-player: Inspect player position, health, inventories, and equipment.\n" +
+        "Usage: factorio observe-player --limit-inventory <n> --limit-equipment <n>\n"
       );
     case "observe-research":
-      return "Usage: factorio-agent observe-research --limit-available <n>\n";
+      return (
+        "observe-research: Get current research, queue, and available technologies.\n" +
+        "Usage: factorio observe-research --limit-available <n>\n"
+      );
     case "observe-recipes":
       return (
-        "Usage: factorio-agent observe-recipes --limit-recipes <n> [--unlocked-only]\n"
+        "observe-recipes: List available recipes and their ingredients/products.\n" +
+        "Usage: factorio observe-recipes --limit-recipes <n> [--unlocked-only]\n"
       );
     case "act-build":
       return (
-        "Usage: factorio-agent act-build --entity name,x,y,dir [--entity ...]\n" +
-        "   or: factorio-agent act-build --entities-json <json>\n"
+        "act-build: Place entities at tile coordinates (direction optional).\n" +
+        "Usage: factorio act-build --entity name,x,y,dir [--entity ...]\n" +
+        "   or: factorio act-build --entities-json <json>\n" +
+        "Direction: 0=north (up), 4=east (right), 8=south (down), 12=west (left).\n"
       );
     case "act-mine":
       return (
-        "Usage: factorio-agent act-mine --target x,y [--target ...]\n" +
-        "   or: factorio-agent act-mine --targets-json <json>\n"
+        "act-mine: Mine entities at target tile coordinates (first entity at each point).\n" +
+        "Usage: factorio act-mine --target x,y [--target ...]\n" +
+        "   or: factorio act-mine --targets-json <json>\n"
       );
     case "act-rotate":
       return (
-        "Usage: factorio-agent act-rotate --target x,y [--target ...]\n" +
-        "   or: factorio-agent act-rotate --targets-json <json>\n"
+        "act-rotate: Rotate entities at target tile coordinates (first entity at each point).\n" +
+        "Usage: factorio act-rotate --target x,y [--target ...]\n" +
+        "   or: factorio act-rotate --targets-json <json>\n" +
+        "Direction (in results): 0=north (up), 4=east (right), 8=south (down), 12=west (left).\n"
       );
     case "act-set-recipe":
       return (
-        "Usage: factorio-agent act-set-recipe --target x,y,recipe [--target ...]\n" +
-        "   or: factorio-agent act-set-recipe --targets-json <json>\n"
+        "act-set-recipe: Set the recipe on assemblers at target tile coordinates.\n" +
+        "Usage: factorio act-set-recipe --target x,y,recipe [--target ...]\n" +
+        "   or: factorio act-set-recipe --targets-json <json>\n"
+      );
+    case "act-research":
+      return (
+        "act-research: Start researching a technology.\n" +
+        "Usage: factorio act-research --technology <name>\n"
       );
     case "act-craft":
-      return "Usage: factorio-agent act-craft --item <name> --count <n>\n";
+      return (
+        "act-craft: Start crafting a recipe in the player's crafting queue.\n" +
+        "Usage: factorio act-craft --item <name> --count <n>\n"
+      );
     case "act-insert":
       return (
-        "Usage: factorio-agent act-insert --entity x,y --item <name> --count <n>\n"
+        "act-insert: Move items from player inventory into an entity at x,y.\n" +
+        "Usage: factorio act-insert --entity x,y --item <name> --count <n>\n"
       );
     case "act-extract":
       return (
-        "Usage: factorio-agent act-extract --entity x,y --item <name> --count <n>\n"
+        "act-extract: Remove items from an entity at x,y into player inventory.\n" +
+        "Usage: factorio act-extract --entity x,y --item <name> --count <n>\n"
       );
     case "wait":
-      return "Usage: factorio-agent wait --ms <n>\n";
+      return (
+        "wait: Sleep locally for N milliseconds between actions.\n" +
+        "Usage: factorio wait --ms <n>\n"
+      );
     default:
       return null;
   }
@@ -259,16 +308,25 @@ async function main() {
   try {
     switch (cmd) {
       case "server-status": {
-        const data = await httpRequest(parsed.base, "GET", "/api/server/status");
+        const data = await httpRequest(
+          parsed.base,
+          "GET",
+          "/api/server/status",
+        );
         writeResponse({ ok: true, cmd, data, timing_ms: Date.now() - started });
         return;
       }
       case "server-start": {
         const save = getFlag(parsed.flags, "save");
         if (!save) throw new Error("Missing --save");
-        const data = await httpRequest(parsed.base, "POST", "/api/server/start", {
-          save,
-        });
+        const data = await httpRequest(
+          parsed.base,
+          "POST",
+          "/api/server/start",
+          {
+            save,
+          },
+        );
         writeResponse({ ok: true, cmd, data, timing_ms: Date.now() - started });
         return;
       }
@@ -287,11 +345,6 @@ async function main() {
         const windowY = parseNumber(getFlag(parsed.flags, "window-y"), 0);
         const radius = parseNumber(getFlag(parsed.flags, "radius"), 12);
         const include = parseCsv(getFlag(parsed.flags, "include"));
-        const limitTiles = parseNumber(getFlag(parsed.flags, "limit-tiles"), undefined);
-        const limitEntities = parseNumber(
-          getFlag(parsed.flags, "limit-entities"),
-          undefined,
-        );
         const data = await httpRequest(
           parsed.base,
           "POST",
@@ -299,10 +352,6 @@ async function main() {
           {
             window: { x: windowX, y: windowY, radius },
             include: include.length > 0 ? include : undefined,
-            limits: {
-              tiles: limitTiles,
-              entities: limitEntities,
-            },
           },
         );
         writeResponse({
@@ -378,10 +427,11 @@ async function main() {
             filters: unlockedOnly ? { unlocked: true } : undefined,
           },
         );
+        const payload = parseJsonIfString(data?.data ?? data);
         writeResponse({
           ok: true,
           cmd,
-          data: data?.data ?? data,
+          data: payload,
           truncated: data?.truncated,
           timing_ms: Date.now() - started,
         });
@@ -463,6 +513,23 @@ async function main() {
           cmd,
           data: data?.data ?? data,
           truncated: data?.truncated,
+          timing_ms: Date.now() - started,
+        });
+        return;
+      }
+      case "act-research": {
+        const technology = getFlag(parsed.flags, "technology");
+        if (!technology) throw new Error("Missing --technology");
+        const data = await httpRequest(
+          parsed.base,
+          "POST",
+          "/api/agent/act/research",
+          { technology },
+        );
+        writeResponse({
+          ok: true,
+          cmd,
+          data: data?.data ?? data,
           timing_ms: Date.now() - started,
         });
         return;
