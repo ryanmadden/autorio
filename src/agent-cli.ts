@@ -43,6 +43,9 @@ Commands:
   observe-player --limit-inventory <n> --limit-equipment <n>
   observe-research --limit-available <n>
   observe-recipes --limit-recipes <n> [--unlocked-only]
+  observe-entity --target x,y [--target ...] [--targets-json <json>]
+  observe-resources --window-x <n> --window-y <n> --radius <n>
+  observe-entity-prototype --name <entity-name>
   act-build --entity name,x,y,dir [--entity ...] [--entities-json <json>]
   act-mine --target x,y [--target ...] [--targets-json <json>]
   act-rotate --target x,y [--target ...] [--targets-json <json>]
@@ -50,7 +53,7 @@ Commands:
   act-research --technology <name>
   act-craft --item <name> --count <n>
   act-insert --entity x,y --item <name> --count <n>
-  act-extract --entity x,y --item <name> --count <n>
+  act-extract --entity x,y --item <name> --count <n|all>
   wait --ms <n>
 
 Global options:
@@ -104,6 +107,22 @@ function usageForCommand(command: string | null) {
         "observe-recipes: List available recipes and their ingredients/products.\n" +
         "Usage: factorio observe-recipes --limit-recipes <n> [--unlocked-only]\n"
       );
+    case "observe-entity":
+      return (
+        "observe-entity: Inspect entity status, fuel, fluids, recipe, inventory.\n" +
+        "Usage: factorio observe-entity --target x,y [--target ...]\n" +
+        "   or: factorio observe-entity --targets-json <json>\n"
+      );
+    case "observe-resources":
+      return (
+        "observe-resources: Scan for resource patches in a radius.\n" +
+        "Usage: factorio observe-resources --window-x <n> --window-y <n> --radius <n>\n"
+      );
+    case "observe-entity-prototype":
+      return (
+        "observe-entity-prototype: Look up entity dimensions, fluid connections, energy info.\n" +
+        "Usage: factorio observe-entity-prototype --name <entity-name>\n"
+      );
     case "act-build":
       return (
         "act-build: Place entities at tile coordinates (direction optional).\n" +
@@ -148,7 +167,7 @@ function usageForCommand(command: string | null) {
     case "act-extract":
       return (
         "act-extract: Remove items from an entity at x,y into player inventory.\n" +
-        "Usage: factorio act-extract --entity x,y --item <name> --count <n>\n"
+        "Usage: factorio act-extract --entity x,y --item <name> --count <n|all>\n"
       );
     case "wait":
       return (
@@ -437,6 +456,61 @@ async function main() {
         });
         return;
       }
+      case "observe-entity": {
+        const targetsJson = getFlag(parsed.flags, "targets-json");
+        const targets = targetsJson
+          ? JSON.parse(targetsJson)
+          : parseTargets(getFlagAll(parsed.flags, "target"), false);
+        const data = await httpRequest(
+          parsed.base,
+          "POST",
+          "/api/agent/observe/entity",
+          { targets },
+        );
+        writeResponse({
+          ok: true,
+          cmd,
+          data: data?.data ?? data,
+          truncated: data?.truncated,
+          timing_ms: Date.now() - started,
+        });
+        return;
+      }
+      case "observe-resources": {
+        const windowX = parseNumber(getFlag(parsed.flags, "window-x"), 0);
+        const windowY = parseNumber(getFlag(parsed.flags, "window-y"), 0);
+        const radius = parseNumber(getFlag(parsed.flags, "radius"), 50);
+        const data = await httpRequest(
+          parsed.base,
+          "POST",
+          "/api/agent/observe/resources",
+          { window: { x: windowX, y: windowY, radius } },
+        );
+        writeResponse({
+          ok: true,
+          cmd,
+          data: data?.data ?? data,
+          timing_ms: Date.now() - started,
+        });
+        return;
+      }
+      case "observe-entity-prototype": {
+        const name = getFlag(parsed.flags, "name");
+        if (!name) throw new Error("Missing --name");
+        const data = await httpRequest(
+          parsed.base,
+          "POST",
+          "/api/agent/observe/entity-prototype",
+          { name },
+        );
+        writeResponse({
+          ok: true,
+          cmd,
+          data: data?.data ?? data,
+          timing_ms: Date.now() - started,
+        });
+        return;
+      }
       case "act-build": {
         const entitiesJson = getFlag(parsed.flags, "entities-json");
         const entities = entitiesJson
@@ -576,7 +650,9 @@ async function main() {
       case "act-extract": {
         const entityValue = getFlag(parsed.flags, "entity");
         const item = getFlag(parsed.flags, "item");
-        const count = parseNumber(getFlag(parsed.flags, "count"), 1);
+        const rawCount = getFlag(parsed.flags, "count");
+        const count: number | string =
+          rawCount === "all" ? "all" : (parseNumber(rawCount, 1) ?? 1);
         if (!entityValue) throw new Error("Missing --entity");
         if (!item) throw new Error("Missing --item");
         const target = parseTargets([entityValue], false)[0];

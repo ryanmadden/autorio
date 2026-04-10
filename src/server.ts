@@ -248,8 +248,8 @@ function worldInfoCommand(): string {
     "end",
     "local tile_x=math.floor(e.position.x)",
     "local tile_y=math.floor(e.position.y)",
-    "local entry='{\"name\":'..esc(e.name)..',\"type\":'..esc(e.type)..',\"x\":'..esc(e.position.x)",
-    "entry=entry..',\"y\":'..esc(e.position.y)..',\"tile_x\":'..esc(tile_x)..',\"tile_y\":'..esc(tile_y)",
+    "local entry='{\"name\":'..esc(e.name)..',\"type\":'..esc(e.type)..',\"x\":'..esc(tile_x)",
+    "entry=entry..',\"y\":'..esc(tile_y)..',\"center_x\":'..esc(e.position.x)..',\"center_y\":'..esc(e.position.y)",
     "entry=entry..',\"box_left\":'..esc(box_left)..',\"box_top\":'..esc(box_top)..',\"box_right\":'..esc(box_right)..',\"box_bottom\":'..esc(box_bottom)",
     "entry=entry..',\"direction\":'..esc(e.direction)",
     "entry=entry..',\"force\":'..esc(force_name)..',\"health\":'..esc(health)..'}'",
@@ -403,8 +403,8 @@ function agentWorldCommand(params: {
     "end",
     "local tile_x=math.floor(e.position.x)",
     "local tile_y=math.floor(e.position.y)",
-    "local entry='{\"name\":'..esc(e.name)..',\"type\":'..esc(e.type)..',\"x\":'..esc(e.position.x)",
-    "entry=entry..',\"y\":'..esc(e.position.y)..',\"tile_x\":'..esc(tile_x)..',\"tile_y\":'..esc(tile_y)",
+    "local entry='{\"name\":'..esc(e.name)..',\"type\":'..esc(e.type)..',\"x\":'..esc(tile_x)",
+    "entry=entry..',\"y\":'..esc(tile_y)..',\"center_x\":'..esc(e.position.x)..',\"center_y\":'..esc(e.position.y)",
     "entry=entry..',\"box_left\":'..esc(box_left)..',\"box_top\":'..esc(box_top)..',\"box_right\":'..esc(box_right)..',\"box_bottom\":'..esc(box_bottom)",
     "entry=entry..',\"direction\":'..esc(e.direction)",
     "entry=entry..',\"force\":'..esc(force_name)..',\"health\":'..esc(health)..'}'",
@@ -497,20 +497,30 @@ function agentPlayerCommand(params: {
     "end",
     "end",
     "end",
-    "local out={}",
-    "table.insert(out,'\"player\":{')",
-    "table.insert(out,'\"name\":'..esc(player.name))",
-    "table.insert(out,',\"x\":'..esc(player.position.x))",
-    "table.insert(out,',\"y\":'..esc(player.position.y))",
+    "local craft_out={}",
+    "local cq=player.crafting_queue",
+    "if cq then",
+    "for i=1,#cq do",
+    "local c=cq[i]",
+    "local entry='{\"recipe\":'..esc(c.recipe)..',\"count\":'..esc(c.count)..',\"prerequisite\":'..esc(c.prerequisite)..'}'",
+    "table.insert(craft_out,entry)",
+    "end",
+    "end",
+    "local pf={}",
+    "table.insert(pf,'\"name\":'..esc(player.name))",
+    "table.insert(pf,'\"x\":'..esc(player.position.x))",
+    "table.insert(pf,'\"y\":'..esc(player.position.y))",
     "local direction=nil",
     "if player.character then direction=player.character.direction end",
-    "table.insert(out,',\"direction\":'..esc(direction))",
-    "table.insert(out,',\"health\":'..esc(player.character and player.character.health))",
-    "table.insert(out,',\"energy\":'..esc(player.character and player.character.energy))",
-    "table.insert(out,',\"inventories\":['..table.concat(inventories,',')..']')",
-    "table.insert(out,',\"equipment\":['..table.concat(equipment_out,',')..']')",
-    "table.insert(out,'}')",
-    "table.insert(out,',\"counts\":{\"inventory_total\":'..inv_total..',\"inventory_included\":'..inv_included..',\"equipment_total\":'..equip_total..',\"equipment_included\":'..equip_included..'}')",
+    "table.insert(pf,'\"direction\":'..esc(direction))",
+    "table.insert(pf,'\"health\":'..esc(player.character and player.character.health))",
+    "table.insert(pf,'\"energy\":'..esc(player.character and player.character.energy))",
+    "table.insert(pf,'\"inventories\":['..table.concat(inventories,',')..']')",
+    "table.insert(pf,'\"equipment\":['..table.concat(equipment_out,',')..']')",
+    "table.insert(pf,'\"crafting_queue\":['..table.concat(craft_out,',')..']')",
+    "local out={}",
+    "table.insert(out,'\"player\":{'..table.concat(pf,',')..'}')",
+    "table.insert(out,'\"counts\":{\"inventory_total\":'..inv_total..',\"inventory_included\":'..inv_included..',\"equipment_total\":'..equip_total..',\"equipment_included\":'..equip_included..'}')",
     "rcon.print('{'..table.concat(out,',')..'}')",
   ];
   return parts.join(" ");
@@ -646,12 +656,26 @@ function agentBuildCommand(
     "local results={}",
     "local function place(name,x,y,dir)",
     "local can=s.can_place_entity{name=name,position={x=x,y=y},direction=dir,force=force}",
-    "if not can then return {name=name,x=x,y=y,ok=false,error='Placement blocked: collision or invalid position'} end",
-    "local ok,err=pcall(function()",
-    "s.create_entity{ name=name, position={x=x,y=y}, direction=dir, force=force }",
+    "if not can then",
+    "local colliders=s.find_entities_filtered{area={{x-1,y-1},{x+2,y+2}}} or {}",
+    "local blocking=nil",
+    "for _,c in pairs(colliders) do",
+    "if c.valid then blocking={name=c.name,x=math.floor(c.position.x),y=math.floor(c.position.y)} break end",
+    "end",
+    "local tile=s.get_tile(x,y)",
+    "local tile_name=tile and tile.name or 'unknown'",
+    "if blocking then",
+    "return {name=name,x=x,y=y,ok=false,error='collision',detail='Blocked by '..blocking.name..' at '..blocking.x..','..blocking.y,blocking_entity=blocking}",
+    "else",
+    "return {name=name,x=x,y=y,ok=false,error='invalid_position',tile=tile_name,detail='Cannot place on '..tile_name}",
+    "end",
+    "end",
+    "local ok,result=pcall(function()",
+    "return s.create_entity{ name=name, position={x=x,y=y}, direction=dir, force=force }",
     "end)",
+    "if ok and result then return {name=name,x=x,y=y,ok=true,center_x=result.position.x,center_y=result.position.y,direction=result.direction} end",
     "if ok then return {name=name,x=x,y=y,ok=true} end",
-    "return {name=name,x=x,y=y,ok=false,error=tostring(err)}",
+    "return {name=name,x=x,y=y,ok=false,error='create_failed',detail=tostring(result)}",
     "end",
   ];
   for (const item of items) {
@@ -666,6 +690,13 @@ function agentBuildCommand(
     "local r=results[i]",
     "local entry='{\"name\":'..esc(r.name)..',\"x\":'..r.x..',\"y\":'..r.y..',\"ok\":'..tostring(r.ok)",
     "if r.error then entry=entry..',\"error\":'..esc(r.error) end",
+    "if r.detail then entry=entry..',\"detail\":'..esc(r.detail) end",
+    "if r.tile then entry=entry..',\"tile\":'..esc(r.tile) end",
+    "if r.blocking_entity then",
+    "entry=entry..',\"blocking_entity\":{\"name\":'..esc(r.blocking_entity.name)..',\"x\":'..r.blocking_entity.x..',\"y\":'..r.blocking_entity.y..'}'",
+    "end",
+    "if r.center_x then entry=entry..',\"center_x\":'..esc(r.center_x)..',\"center_y\":'..esc(r.center_y) end",
+    "if r.direction then entry=entry..',\"direction\":'..esc(r.direction) end",
     "entry=entry..'}'",
     "table.insert(out,entry)",
     "end",
@@ -907,19 +938,19 @@ function agentCraftCommand(recipe: string, count: number): string {
     "if craftable < count then",
     "local out={}",
     "table.insert(out,'\"recipe\":'..esc(recipe))",
-    "table.insert(out,',\"count\":'..esc(count))",
-    "table.insert(out,',\"craftable\":'..esc(craftable))",
-    "table.insert(out,',\"ok\":false')",
-    "table.insert(out,',\"error\":'..esc('Insufficient ingredients'))",
+    "table.insert(out,'\"count\":'..esc(count))",
+    "table.insert(out,'\"craftable\":'..esc(craftable))",
+    "table.insert(out,'\"ok\":false')",
+    "table.insert(out,'\"error\":'..esc('Insufficient ingredients'))",
     "rcon.print('{'..table.concat(out,',')..'}')",
     "return",
     "end",
     "local ok,err=pcall(function() player.begin_crafting{recipe=recipe,count=count} end)",
     "local out={}",
     "table.insert(out,'\"recipe\":'..esc(recipe))",
-    "table.insert(out,',\"count\":'..esc(count))",
-    "table.insert(out,',\"ok\":'..tostring(ok))",
-    "if err then table.insert(out,',\"error\":'..esc(tostring(err))) end",
+    "table.insert(out,'\"count\":'..esc(count))",
+    "table.insert(out,'\"ok\":'..tostring(ok))",
+    "if err then table.insert(out,'\"error\":'..esc(tostring(err))) end",
     "rcon.print('{'..table.concat(out,',')..'}')",
   ];
   return parts.join(" ");
@@ -970,8 +1001,9 @@ function agentExtractCommand(params: {
   x: number;
   y: number;
   item: string;
-  count: number;
+  count: number | "all";
 }): string {
+  const luaCount = params.count === "all" ? -1 : params.count;
   const parts = [
     "/sc",
     "local s=game.surfaces[1]",
@@ -991,26 +1023,269 @@ function agentExtractCommand(params: {
     `local x=${params.x}`,
     `local y=${params.y}`,
     `local item=${luaString(params.item)}`,
-    `local count=${params.count}`,
+    `local count=${luaCount}`,
     "local ents=s.find_entities_filtered{position={x,y}} or {}",
     "local e=ents[1]",
     'if not e then rcon.print(\'{"ok":false,"error":"no_entity"}\') return end',
     "local available=e.get_item_count(item) or 0",
+    "if count == -1 then count=available end",
     "if available < count then",
     "local out={}",
     "table.insert(out,'\"ok\":false')",
-    "table.insert(out,',\"error\":'..esc('count too high: requested '..count..' but only '..available..' available'))",
-    "table.insert(out,',\"available\":'..esc(available))",
-    "table.insert(out,',\"requested\":'..esc(count))",
+    "table.insert(out,'\"error\":'..esc('count too high: requested '..count..' but only '..available..' available'))",
+    "table.insert(out,'\"available\":'..esc(available))",
+    "table.insert(out,'\"requested\":'..esc(count))",
     "rcon.print('{'..table.concat(out,',')..'}')",
+    "return",
+    "end",
+    "if count == 0 then",
+    "rcon.print('{\"ok\":true,\"removed\":0,\"inserted\":0}')",
     "return",
     "end",
     "local removed=e.remove_item{name=item,count=count}",
     "local inserted=player.insert{name=item,count=removed}",
     "local out={}",
     "table.insert(out,'\"ok\":true')",
-    "table.insert(out,',\"removed\":'..esc(removed))",
-    "table.insert(out,',\"inserted\":'..esc(inserted))",
+    "table.insert(out,'\"removed\":'..esc(removed))",
+    "table.insert(out,'\"inserted\":'..esc(inserted))",
+    "rcon.print('{'..table.concat(out,',')..'}')",
+  ];
+  return parts.join(" ");
+}
+
+function agentObserveEntityCommand(
+  targets: Array<{ x: number; y: number }>,
+): string {
+  const parts = [
+    "/sc",
+    "local s=game.surfaces[1]",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    "local results={}",
+    "local function find_entity(x,y)",
+    "local ents=s.find_entities_filtered{position={x,y}} or {}",
+    "if #ents > 0 then return ents[1] end",
+    "local area={{x-0.5,y-0.5},{x+0.5,y+0.5}}",
+    "ents=s.find_entities_filtered{area=area} or {}",
+    "for i=1,#ents do",
+    "local cand=ents[i]",
+    "if cand and cand.valid then return cand end",
+    "end",
+    "return nil",
+    "end",
+    "local function observe(x,y)",
+    "local e=find_entity(x,y)",
+    "if not e then return '{\"x\":'..x..',\"y\":'..y..',\"ok\":false,\"error\":\"no_entity\"}' end",
+    "local f={}",
+    "table.insert(f,'\"ok\":true')",
+    "table.insert(f,'\"name\":'..esc(e.name))",
+    "table.insert(f,'\"type\":'..esc(e.type))",
+    "table.insert(f,'\"x\":'..esc(math.floor(e.position.x)))",
+    "table.insert(f,'\"y\":'..esc(math.floor(e.position.y)))",
+    "table.insert(f,'\"center_x\":'..esc(e.position.x))",
+    "table.insert(f,'\"center_y\":'..esc(e.position.y))",
+    "table.insert(f,'\"direction\":'..esc(e.direction))",
+    "local ok_s,status=pcall(function() return e.status end)",
+    "if ok_s and status then",
+    "local status_names={}",
+    "for k,v in pairs(defines.entity_status) do status_names[v]=k end",
+    "table.insert(f,'\"status\":'..esc(status_names[status] or tostring(status)))",
+    "else",
+    "table.insert(f,'\"status\":null')",
+    "end",
+    "local ok_h,health=pcall(function() return e.health end)",
+    "table.insert(f,'\"health\":'..esc(ok_h and health or nil))",
+    "local ok_mh,max_health=pcall(function() return e.prototype.max_health end)",
+    "table.insert(f,'\"max_health\":'..esc(ok_mh and max_health or nil))",
+    "local ok_e,energy=pcall(function() return e.energy end)",
+    "table.insert(f,'\"energy\":'..esc(ok_e and energy or nil))",
+    "local fuel_out={}",
+    "local ok_fi,fi=pcall(function() return e.get_fuel_inventory() end)",
+    "if ok_fi and fi and fi.valid then",
+    "for i=1,#fi do",
+    "local stack=fi[i]",
+    "if stack and stack.valid_for_read then",
+    "table.insert(fuel_out,'{\"name\":'..esc(stack.name)..',\"count\":'..stack.count..'}')",
+    "end",
+    "end",
+    "end",
+    "table.insert(f,'\"fuel_inventory\":['..table.concat(fuel_out,',')..']')",
+    "local fb_out={}",
+    "local ok_fb,fb_count=pcall(function() return #e.fluidbox end)",
+    "if ok_fb and fb_count and fb_count > 0 then",
+    "for i=1,fb_count do",
+    "local fb_entry={}",
+    "table.insert(fb_entry,'\"index\":'..i)",
+    "local ok_fluid,fluid=pcall(function() return e.fluidbox[i] end)",
+    "if ok_fluid and fluid then",
+    "table.insert(fb_entry,'\"fluid\":'..esc(fluid.name))",
+    "table.insert(fb_entry,'\"amount\":'..esc(fluid.amount))",
+    "else",
+    "table.insert(fb_entry,'\"fluid\":null')",
+    "table.insert(fb_entry,'\"amount\":0')",
+    "end",
+    "local ok_conn,conns=pcall(function() return e.fluidbox.get_connections(i) end)",
+    "local conn_out={}",
+    "if ok_conn and conns then",
+    "for _,c in pairs(conns) do",
+    "local owner=c.owner",
+    "if owner then",
+    "table.insert(conn_out,'{\"name\":'..esc(owner.name)..',\"x\":'..esc(math.floor(owner.position.x))..',\"y\":'..esc(math.floor(owner.position.y))..'}')",
+    "end",
+    "end",
+    "end",
+    "table.insert(fb_entry,'\"connected_to\":['..table.concat(conn_out,',')..']')",
+    "table.insert(fb_out,'{'..table.concat(fb_entry,',')..'}')",
+    "end",
+    "end",
+    "table.insert(f,'\"fluid_boxes\":['..table.concat(fb_out,',')..']')",
+    "local ok_r,recipe=pcall(function() local r=e.get_recipe() return r and r.name or nil end)",
+    "table.insert(f,'\"recipe\":'..esc(ok_r and recipe or nil))",
+    "local output_out={}",
+    "local ok_oi,oi=pcall(function() return e.get_output_inventory() end)",
+    "if ok_oi and oi and oi.valid then",
+    "for i=1,#oi do",
+    "local stack=oi[i]",
+    "if stack and stack.valid_for_read then",
+    "table.insert(output_out,'{\"name\":'..esc(stack.name)..',\"count\":'..stack.count..'}')",
+    "end",
+    "end",
+    "end",
+    "table.insert(f,'\"output_inventory\":['..table.concat(output_out,',')..']')",
+    "return '{'..table.concat(f,',')..'}'",
+    "end",
+  ];
+  for (const target of targets) {
+    parts.push(`table.insert(results,observe(${target.x},${target.y}))`);
+  }
+  parts.push(
+    "rcon.print('{\"results\":['..table.concat(results,',')..']}')",
+  );
+  return parts.join(" ");
+}
+
+function agentResourcesCommand(params: {
+  x: number;
+  y: number;
+  radius: number;
+}): string {
+  const minX = params.x - params.radius;
+  const maxX = params.x + params.radius;
+  const minY = params.y - params.radius;
+  const maxY = params.y + params.radius;
+  const parts = [
+    "/sc",
+    "local s=game.surfaces[1]",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    `local min_x=${minX}`,
+    `local max_x=${maxX}`,
+    `local min_y=${minY}`,
+    `local max_y=${maxY}`,
+    "local resources=s.find_entities_filtered{area={{min_x,min_y},{max_x+1,max_y+1}},type='resource'} or {}",
+    "local groups={}",
+    "for i=1,#resources do",
+    "local e=resources[i]",
+    "local n=e.name",
+    "if not groups[n] then groups[n]={count=0,amount=0,min_x=e.position.x,min_y=e.position.y,max_x=e.position.x,max_y=e.position.y,sum_x=0,sum_y=0} end",
+    "local g=groups[n]",
+    "g.count=g.count+1",
+    "g.amount=g.amount+(e.amount or 0)",
+    "g.sum_x=g.sum_x+e.position.x",
+    "g.sum_y=g.sum_y+e.position.y",
+    "if e.position.x < g.min_x then g.min_x=e.position.x end",
+    "if e.position.y < g.min_y then g.min_y=e.position.y end",
+    "if e.position.x > g.max_x then g.max_x=e.position.x end",
+    "if e.position.y > g.max_y then g.max_y=e.position.y end",
+    "end",
+    "local out={}",
+    "for name,g in pairs(groups) do",
+    "local cx=math.floor(g.sum_x/g.count)",
+    "local cy=math.floor(g.sum_y/g.count)",
+    "table.insert(out,'{\"name\":'..esc(name)..',\"tile_count\":'..g.count..',\"amount\":'..g.amount..',\"center\":{\"x\":'..cx..',\"y\":'..cy..'},\"bounds\":{\"min_x\":'..math.floor(g.min_x)..',\"min_y\":'..math.floor(g.min_y)..',\"max_x\":'..math.floor(g.max_x)..',\"max_y\":'..math.floor(g.max_y)..'}}')",
+    "end",
+    "rcon.print('{\"patches\":['..table.concat(out,',')..'],\"total_entities\":'..#resources..'}')",
+  ];
+  return parts.join(" ");
+}
+
+function agentEntityPrototypeCommand(name: string): string {
+  const parts = [
+    "/sc",
+    "local function esc(v)",
+    "if v==nil then return 'null' end",
+    "local t=type(v)",
+    'if t==\"string\" then',
+    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    'elseif t==\"number\" or t==\"boolean\" then',
+    "return tostring(v)",
+    "else",
+    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+    "end",
+    "end",
+    `local name=${luaString(name)}`,
+    "local proto=game.entity_prototypes[name]",
+    "if not proto then rcon.print('{\"ok\":false,\"error\":'..esc('Unknown entity: '..name)..'}') return end",
+    "local w=0 local h=0",
+    "if proto.collision_box then",
+    "local cb=proto.collision_box",
+    "w=math.ceil(cb.right_bottom.x - cb.left_top.x)",
+    "h=math.ceil(cb.right_bottom.y - cb.left_top.y)",
+    "end",
+    "local fb_out={}",
+    "if proto.fluidbox_prototypes then",
+    "for i,fb in pairs(proto.fluidbox_prototypes) do",
+    "local conns={}",
+    "if fb.pipe_connections then",
+    "for _,pc in pairs(fb.pipe_connections) do",
+    "local pos_out={}",
+    "if pc.positions then",
+    "for pi,pos in pairs(pc.positions) do",
+    "table.insert(pos_out,'{\"x\":'..esc(pos.x)..',\"y\":'..esc(pos.y)..'}')",
+    "end",
+    "end",
+    "table.insert(conns,'{\"type\":'..esc(pc.type)..',\"positions\":['..table.concat(pos_out,',')..']}')",
+    "end",
+    "end",
+    "table.insert(fb_out,'{\"production_type\":'..esc(fb.production_type)..',\"pipe_connections\":['..table.concat(conns,',')..']}')",
+    "end",
+    "end",
+    "local energy_type='none'",
+    "if proto.electric_energy_source_prototype then energy_type='electric'",
+    "elseif proto.burner_prototype then energy_type='burner'",
+    "end",
+    "local fuel_cats={}",
+    "if proto.burner_prototype and proto.burner_prototype.fuel_categories then",
+    "for cat,_ in pairs(proto.burner_prototype.fuel_categories) do",
+    "table.insert(fuel_cats,esc(cat))",
+    "end",
+    "end",
+    "local out={}",
+    "table.insert(out,'\"name\":'..esc(name))",
+    "table.insert(out,'\"width\":'..w)",
+    "table.insert(out,'\"height\":'..h)",
+    "table.insert(out,'\"fluid_boxes\":['..table.concat(fb_out,',')..']')",
+    "table.insert(out,'\"energy_type\":'..esc(energy_type))",
+    "table.insert(out,'\"fuel_categories\":['..table.concat(fuel_cats,',')..']')",
+    "table.insert(out,'\"max_health\":'..esc(proto.max_health))",
     "rcon.print('{'..table.concat(out,',')..'}')",
   ];
   return parts.join(" ");
@@ -1764,7 +2039,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     }
     const from = body?.from?.entity || body?.entity || {};
     const item = body?.item;
-    const count = clampInt(body?.count, 1, 1, 100000);
+    const rawCount = body?.count;
+    const countAll = rawCount === "all" || rawCount === -1;
+    const count: number | "all" = countAll
+      ? "all"
+      : clampInt(rawCount, 1, 1, 100000);
     if (!item || typeof item !== "string") {
       return json(res, 400, { error: "Missing item" });
     }
@@ -1785,6 +2064,116 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
         data = JSON.parse(response);
       } catch {
         // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, { ok: true, data });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/observe/entity") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const targets: any[] = Array.isArray(body?.targets) ? body.targets : [];
+    const limits = body?.limits || {};
+    const max = clampInt(limits.max, AGENT_MAX_ACTIONS, 1, AGENT_MAX_ACTIONS);
+    const trimmed = targets
+      .slice(0, max)
+      .filter((t) => t?.x !== undefined && t?.y !== undefined);
+    try {
+      const response = await rconCommand(agentObserveEntityCommand(trimmed));
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, {
+        ok: true,
+        data,
+        truncated: targets.length > trimmed.length,
+      });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (
+    req.method === "POST" &&
+    url.pathname === "/api/agent/observe/resources"
+  ) {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const window = body?.window || {};
+    const radius = clampInt(window.radius, 50, 1, 500);
+    const x = clampInt(window.x, 0, -1000000, 1000000);
+    const y = clampInt(window.y, 0, -1000000, 1000000);
+    try {
+      const response = await rconCommand(
+        agentResourcesCommand({ x, y, radius }),
+      );
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      return json(res, 200, { ok: true, data });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (
+    req.method === "POST" &&
+    url.pathname === "/api/agent/observe/entity-prototype"
+  ) {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    const name = body?.name;
+    if (!name || typeof name !== "string") {
+      return json(res, 400, { error: "Missing entity name" });
+    }
+    try {
+      const response = await rconCommand(agentEntityPrototypeCommand(name));
+      let data: any = response;
+      try {
+        data = JSON.parse(response);
+      } catch {
+        // Leave as raw string if it isn't JSON.
+      }
+      if (data && typeof data === "object" && data.ok === false) {
+        return json(res, 400, { error: data?.error || "Unknown entity", data });
       }
       return json(res, 200, { ok: true, data });
     } catch (err: any) {
