@@ -1,4 +1,7 @@
 /factorio/
 /node_modules/
 /dist/
+/factorio.pid
 .env
+__pycache__/
+*.py[cod]

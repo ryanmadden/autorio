@@ -11,6 +11,8 @@ type ResponseShape = {
   timing_ms: number;
 };
 
+const API_SCHEMA_VERSION = 2;
+
 type ParsedArgs = {
   base: string;
   command: string | null;
@@ -19,7 +21,7 @@ type ParsedArgs = {
 };
 
 function writeResponse(resp: ResponseShape) {
-  process.stdout.write(`${JSON.stringify(resp)}\n`);
+  process.stdout.write(`${JSON.stringify({ schema_version: API_SCHEMA_VERSION, ...resp })}\n`);
 }
 
 function parseJsonIfString(value: unknown) {
@@ -39,15 +41,17 @@ Commands:
   server-start --save <name>.zip
   server-stop
   server-saves
-  observe-world --window-x <n> --window-y <n> --radius <n> --include tiles,entities
+  observe-world --window-x <n> --window-y <n> --radius <n> --include terrain,entities
+  observe-map --center-x <n> --center-y <n> --radius <n>
   observe-player --limit-inventory <n> --limit-equipment <n>
-  observe-research --limit-available <n>
+  observe-research --limit-available <n> --limit-locked <n> --limit-completed <n>
   observe-recipes --limit-recipes <n> [--unlocked-only]
   observe-entity --target x,y [--target ...] [--targets-json <json>]
   observe-resources --window-x <n> --window-y <n> --radius <n>
   observe-entity-prototype --name <entity-name>
-  act-build --entity name,x,y,dir [--entity ...] [--entities-json <json>]
-  act-mine --target x,y [--target ...] [--targets-json <json>]
+  observe-placement --entity name,anchor-x,anchor-y,dir [--entity ...]
+  act-build --entity name,anchor-x,anchor-y,dir [--entity ...]
+  act-mine --target x,y [--target ...] [--resource [name]] [--targets-json <json>]
   act-rotate --target x,y [--target ...] [--targets-json <json>]
   act-move --target x,y [--target ...] [--targets-json <json>]
   act-set-recipe --target x,y,recipe [--target ...] [--targets-json <json>]
@@ -56,6 +60,8 @@ Commands:
   act-insert --entity x,y --item <name> --count <n>
   act-extract --entity x,y --item <name> --count <n|all>
   wait --ms <n>
+  job-status --job-id <id>
+  job-cancel --job-id <id>
 
 Notes:
   - This CLI is intended for AI agents playing Factorio headlessly (no visual UI).
@@ -64,6 +70,8 @@ Notes:
 
 Global options:
   --base <url> (default: FACTORIO_API_BASE or http://localhost:3000)
+  --detach (return immediately after creating an action job)
+  --idempotency-key <key> (safely retry action submission)
   --help
 
 More help:
@@ -95,18 +103,23 @@ function usageForCommand(command: string | null) {
       );
     case "observe-world":
       return (
-        "observe-world: Fetch tiles/entities in a window around a target position.\n" +
-        "Usage: factorio observe-world --window-x <n> --window-y <n> --radius <n> --include tiles,entities\n"
+        "observe-world: Fetch compact RLE terrain and entities in a charted window.\n" +
+        "Usage: factorio observe-world --window-x <n> --window-y <n> --radius <n> --include terrain,entities\n"
       );
     case "observe-player":
       return (
         "observe-player: Inspect player position, health, inventories, and equipment.\n" +
         "Usage: factorio observe-player --limit-inventory <n> --limit-equipment <n>\n"
       );
+    case "observe-map":
+      return (
+        "observe-map: Read a player-charted map window; uncharted chunks are masked.\n" +
+        "Usage: factorio observe-map --center-x <n> --center-y <n> --radius <n>\n"
+      );
     case "observe-research":
       return (
-        "observe-research: Get current research, queue, and available technologies.\n" +
-        "Usage: factorio observe-research --limit-available <n>\n"
+        "observe-research: Get current, queued, available, locked, and completed technologies with costs.\n" +
+        "Usage: factorio observe-research --limit-available <n> --limit-locked <n> --limit-completed <n>\n"
       );
     case "observe-recipes":
       return (
@@ -129,19 +142,25 @@ function usageForCommand(command: string | null) {
         "observe-entity-prototype: Look up entity dimensions, fluid connections, energy info.\n" +
         "Usage: factorio observe-entity-prototype --name <entity-name>\n"
       );
+    case "observe-placement":
+      return (
+        "observe-placement: Analyze buildability without consuming an item.\n" +
+        "Usage: factorio observe-placement --entity name,anchor-x,anchor-y,dir [--entity ...]\n"
+      );
     case "act-build":
       return (
-        "act-build: Place entities at tile coordinates (direction optional).\n" +
-        "Usage: factorio act-build --entity name,x,y,dir [--entity ...]\n" +
+        "act-build: Place entities using the top-left occupied tile as the anchor.\n" +
+        "Usage: factorio act-build --entity name,anchor-x,anchor-y,dir [--entity ...]\n" +
         "   or: factorio act-build --entities-json <json>\n" +
         "Direction: 0=north (up), 4=east (right), 8=south (down), 12=west (left).\n" +
         "Note: This action includes simulated walking time based on distance.\n"
       );
     case "act-mine":
       return (
-        "act-mine: Mine entities at target tile coordinates (first entity at each point).\n" +
-        "Usage: factorio act-mine --target x,y [--target ...]\n" +
+        "act-mine: Mine a resource or entity at target tile coordinates.\n" +
+        "Usage: factorio act-mine --target x,y [--target ...] [--resource [name]]\n" +
         "   or: factorio act-mine --targets-json <json>\n" +
+        "Resource mode excludes the character and prioritizes the requested resource deterministically.\n" +
         "Note: This action includes simulated walking time based on distance, plus ~2s per item mined.\n"
       );
     case "act-rotate":
@@ -154,10 +173,10 @@ function usageForCommand(command: string | null) {
       );
     case "act-move":
       return (
-        "act-move: Move the player to target tile coordinates.\n" +
+        "act-move: Move the player through paced, collision-checked steps to target tile coordinates.\n" +
         "Usage: factorio act-move --target x,y [--target ...]\n" +
         "   or: factorio act-move --targets-json <json>\n" +
-        "Note: This action includes simulated walking time based on distance.\n"
+        "Note: Stops and returns partial progress if an intermediate step is blocked.\n"
       );
     case "act-set-recipe":
       return (
@@ -193,6 +212,10 @@ function usageForCommand(command: string | null) {
         "wait: Sleep locally for N milliseconds between actions.\n" +
         "Usage: factorio wait --ms <n>\n"
       );
+    case "job-status":
+      return "job-status: Read action job progress.\nUsage: factorio job-status --job-id <id>\n";
+    case "job-cancel":
+      return "job-cancel: Request cancellation after the current atomic action.\nUsage: factorio job-cancel --job-id <id>\n";
     default:
       return null;
   }
@@ -282,7 +305,7 @@ function parseEntities(values: string[]) {
     if (direction !== undefined && !Number.isFinite(direction)) {
       throw new Error(`Invalid --entity direction in '${entry}'`);
     }
-    return { name, x, y, direction };
+    return { name, anchor: { x, y }, direction };
   });
 }
 
@@ -329,6 +352,33 @@ async function httpRequest(
   return data;
 }
 
+async function submitActionJob(
+  base: string,
+  action: string,
+  payload: unknown,
+  options: { detach: boolean; idempotencyKey?: string },
+) {
+  let job = await httpRequest(base, "POST", "/api/agent/jobs", {
+    action,
+    payload,
+    idempotency_key: options.idempotencyKey,
+  });
+  if (options.detach) return job;
+  const jobId = job?.job_id;
+  if (!jobId) throw new Error("Server did not return a job ID");
+  while (["queued", "running"].includes(job.status)) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    job = await httpRequest(base, "GET", `/api/agent/jobs/${encodeURIComponent(jobId)}`);
+  }
+  return job;
+}
+
+function actionJobOk(job: any) {
+  if (["failed", "cancelled"].includes(job?.status)) return false;
+  if (["queued", "running"].includes(job?.status)) return true;
+  return Array.isArray(job?.results) && job.results.every((result: any) => result?.ok !== false);
+}
+
 async function main() {
   const started = Date.now();
   const parsed = parseArgs(process.argv.slice(2));
@@ -343,6 +393,11 @@ async function main() {
   }
 
   const cmd = parsed.command;
+  const submit = (action: string, payload: unknown) =>
+    submitActionJob(parsed.base, action, payload, {
+      detach: Boolean(getFlag(parsed.flags, "detach")),
+      idempotencyKey: getFlag(parsed.flags, "idempotency-key"),
+    });
   try {
     switch (cmd) {
       case "server-status": {
@@ -389,7 +444,7 @@ async function main() {
           "/api/agent/observe/world",
           {
             window: { x: windowX, y: windowY, radius },
-            include: include.length > 0 ? include : undefined,
+            include: include.length > 0 ? include : ["terrain", "entities"],
           },
         );
         writeResponse({
@@ -399,6 +454,16 @@ async function main() {
           truncated: data?.truncated,
           timing_ms: Date.now() - started,
         });
+        return;
+      }
+      case "observe-map": {
+        const x = parseNumber(getFlag(parsed.flags, "center-x"), 0);
+        const y = parseNumber(getFlag(parsed.flags, "center-y"), 0);
+        const radius = parseNumber(getFlag(parsed.flags, "radius"), 48);
+        const data = await httpRequest(parsed.base, "POST", "/api/agent/observe/map", {
+          window: { x, y, radius },
+        });
+        writeResponse({ ok: true, cmd, data: data?.data ?? data, timing_ms: Date.now() - started });
         return;
       }
       case "observe-player": {
@@ -435,11 +500,13 @@ async function main() {
           getFlag(parsed.flags, "limit-available"),
           undefined,
         );
+        const limitLocked = parseNumber(getFlag(parsed.flags, "limit-locked"), undefined);
+        const limitCompleted = parseNumber(getFlag(parsed.flags, "limit-completed"), undefined);
         const data = await httpRequest(
           parsed.base,
           "POST",
           "/api/agent/observe/research",
-          { limits: { available: limitAvailable } },
+          { limits: { available: limitAvailable, locked: limitLocked, completed: limitCompleted } },
         );
         writeResponse({
           ok: true,
@@ -530,42 +597,46 @@ async function main() {
         });
         return;
       }
-      case "act-build": {
+      case "observe-placement": {
         const entitiesJson = getFlag(parsed.flags, "entities-json");
-        const entities = entitiesJson
+        const placements = entitiesJson
           ? JSON.parse(entitiesJson)
           : parseEntities(getFlagAll(parsed.flags, "entity"));
         const data = await httpRequest(
           parsed.base,
           "POST",
-          "/api/agent/act/build",
-          { entities },
+          "/api/agent/observe/placement",
+          { placements },
         );
+        writeResponse({ ok: true, cmd, data: data?.data ?? data, truncated: data?.truncated, timing_ms: Date.now() - started });
+        return;
+      }
+      case "act-build": {
+        const entitiesJson = getFlag(parsed.flags, "entities-json");
+        const entities = entitiesJson
+          ? JSON.parse(entitiesJson)
+          : parseEntities(getFlagAll(parsed.flags, "entity"));
+        const data = await submit("build", { entities });
         writeResponse({
-          ok: true,
+          ok: actionJobOk(data),
           cmd,
-          data: data?.data ?? data,
-          truncated: data?.truncated,
+          data,
           timing_ms: Date.now() - started,
         });
         return;
       }
       case "act-mine": {
         const targetsJson = getFlag(parsed.flags, "targets-json");
-        const targets = targetsJson
+        let targets = targetsJson
           ? JSON.parse(targetsJson)
           : parseTargets(getFlagAll(parsed.flags, "target"), false);
-        const data = await httpRequest(
-          parsed.base,
-          "POST",
-          "/api/agent/act/mine",
-          { targets },
-        );
+        const resource = getFlag(parsed.flags, "resource");
+        if (resource) targets = targets.map((target: any) => ({ ...target, kind: "resource", name: resource === "true" ? undefined : resource }));
+        const data = await submit("mine", { targets });
         writeResponse({
-          ok: true,
+          ok: actionJobOk(data),
           cmd,
-          data: data?.data ?? data,
-          truncated: data?.truncated,
+          data,
           timing_ms: Date.now() - started,
         });
         return;
@@ -575,17 +646,11 @@ async function main() {
         const targets = targetsJson
           ? JSON.parse(targetsJson)
           : parseTargets(getFlagAll(parsed.flags, "target"), false);
-        const data = await httpRequest(
-          parsed.base,
-          "POST",
-          "/api/agent/act/rotate",
-          { targets },
-        );
+        const data = await submit("rotate", { targets });
         writeResponse({
-          ok: true,
+          ok: actionJobOk(data),
           cmd,
-          data: data?.data ?? data,
-          truncated: data?.truncated,
+          data,
           timing_ms: Date.now() - started,
         });
         return;
@@ -595,17 +660,11 @@ async function main() {
         const targets = targetsJson
           ? JSON.parse(targetsJson)
           : parseTargets(getFlagAll(parsed.flags, "target"), false);
-        const data = await httpRequest(
-          parsed.base,
-          "POST",
-          "/api/agent/act/move",
-          { targets },
-        );
+        const data = await submit("move", { targets });
         writeResponse({
-          ok: true,
+          ok: actionJobOk(data),
           cmd,
-          data: data?.data ?? data,
-          truncated: data?.truncated,
+          data,
           timing_ms: Date.now() - started,
         });
         return;
@@ -615,17 +674,11 @@ async function main() {
         const targets = targetsJson
           ? JSON.parse(targetsJson)
           : parseTargets(getFlagAll(parsed.flags, "target"), true);
-        const data = await httpRequest(
-          parsed.base,
-          "POST",
-          "/api/agent/act/set-recipe",
-          { targets },
-        );
+        const data = await submit("set-recipe", { targets });
         writeResponse({
-          ok: true,
+          ok: actionJobOk(data),
           cmd,
-          data: data?.data ?? data,
-          truncated: data?.truncated,
+          data,
           timing_ms: Date.now() - started,
         });
         return;
@@ -633,16 +686,11 @@ async function main() {
       case "act-research": {
         const technology = getFlag(parsed.flags, "technology");
         if (!technology) throw new Error("Missing --technology");
-        const data = await httpRequest(
-          parsed.base,
-          "POST",
-          "/api/agent/act/research",
-          { technology },
-        );
+        const data = await submit("research", { technology });
         writeResponse({
-          ok: true,
+          ok: actionJobOk(data),
           cmd,
-          data: data?.data ?? data,
+          data,
           timing_ms: Date.now() - started,
         });
         return;
@@ -651,16 +699,11 @@ async function main() {
         const item = getFlag(parsed.flags, "item");
         const count = parseNumber(getFlag(parsed.flags, "count"), 1);
         if (!item) throw new Error("Missing --item");
-        const data = await httpRequest(
-          parsed.base,
-          "POST",
-          "/api/agent/act/craft",
-          { item, count },
-        );
+        const data = await submit("craft", { item, count });
         writeResponse({
-          ok: true,
+          ok: actionJobOk(data),
           cmd,
-          data: data?.data ?? data,
+          data,
           timing_ms: Date.now() - started,
         });
         return;
@@ -672,16 +715,11 @@ async function main() {
         if (!entityValue) throw new Error("Missing --entity");
         if (!item) throw new Error("Missing --item");
         const target = parseTargets([entityValue], false)[0];
-        const data = await httpRequest(
-          parsed.base,
-          "POST",
-          "/api/agent/act/insert",
-          { entity: target, item, count },
-        );
+        const data = await submit("insert", { entity: target, item, count });
         writeResponse({
-          ok: true,
+          ok: actionJobOk(data),
           cmd,
-          data: data?.data ?? data,
+          data,
           timing_ms: Date.now() - started,
         });
         return;
@@ -695,16 +733,11 @@ async function main() {
         if (!entityValue) throw new Error("Missing --entity");
         if (!item) throw new Error("Missing --item");
         const target = parseTargets([entityValue], false)[0];
-        const data = await httpRequest(
-          parsed.base,
-          "POST",
-          "/api/agent/act/extract",
-          { entity: target, item, count },
-        );
+        const data = await submit("extract", { entity: target, item, count });
         writeResponse({
-          ok: true,
+          ok: actionJobOk(data),
           cmd,
-          data: data?.data ?? data,
+          data,
           timing_ms: Date.now() - started,
         });
         return;
@@ -718,6 +751,20 @@ async function main() {
           data: { waited_ms: Math.max(0, ms) },
           timing_ms: Date.now() - started,
         });
+        return;
+      }
+      case "job-status": {
+        const jobId = getFlag(parsed.flags, "job-id");
+        if (!jobId) throw new Error("Missing --job-id");
+        const data = await httpRequest(parsed.base, "GET", `/api/agent/jobs/${encodeURIComponent(jobId)}`);
+        writeResponse({ ok: actionJobOk(data), cmd, data, timing_ms: Date.now() - started });
+        return;
+      }
+      case "job-cancel": {
+        const jobId = getFlag(parsed.flags, "job-id");
+        if (!jobId) throw new Error("Missing --job-id");
+        const data = await httpRequest(parsed.base, "POST", `/api/agent/jobs/${encodeURIComponent(jobId)}/cancel`);
+        writeResponse({ ok: true, cmd, data, timing_ms: Date.now() - started });
         return;
       }
       default:

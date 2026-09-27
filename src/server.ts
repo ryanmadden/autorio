@@ -4,8 +4,11 @@ import fsSync from "fs";
 import { promises as fs } from "fs";
 import path from "path";
 import net from "net";
+import { randomUUID } from "crypto";
 
-const PORT = 3000;
+const PORT = process.env.AUTORIO_PORT
+  ? Number(process.env.AUTORIO_PORT)
+  : 3000;
 const ROOT = process.cwd();
 
 function loadEnvFile() {
@@ -34,6 +37,7 @@ loadEnvFile();
 const FACTORIO_DIR = path.join(ROOT, "factorio");
 const SAVES_DIR = path.join(FACTORIO_DIR, "saves");
 const FACTORIO_BIN = path.join(FACTORIO_DIR, "bin", "x64", "factorio");
+const MAP_GEN_SETTINGS = path.join(FACTORIO_DIR, "data", "map-gen-settings.json");
 const PID_FILE = path.join(ROOT, "factorio.pid");
 
 const LOG_BUFFER_LIMIT = 500;
@@ -54,6 +58,8 @@ const AGENT_MAX_RECIPES = 300;
 const AGENT_MAX_RESEARCH = 200;
 const AGENT_MAX_ACTIONS = 50;
 const CHARACTER_WALK_SPEED_TPS = 8.9;
+const API_SCHEMA_VERSION = 2;
+const JOB_RETENTION_MS = 60 * 60 * 1000;
 
 function parseRconJson<T>(response: string, errorMessage: string): T {
   try {
@@ -61,6 +67,70 @@ function parseRconJson<T>(response: string, errorMessage: string): T {
   } catch {
     throw new Error(errorMessage);
   }
+}
+
+function arrayOrEmpty(value: unknown): any[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeWorldData(data: any) {
+  if (!data || typeof data !== "object") return data;
+  data.entities = arrayOrEmpty(data.entities);
+  if (data.terrain && typeof data.terrain === "object") {
+    data.terrain.rows = arrayOrEmpty(data.terrain.rows);
+    for (const row of data.terrain.rows) row.runs = arrayOrEmpty(row?.runs);
+  }
+  return data;
+}
+
+function normalizeResearchData(data: any) {
+  if (!data || typeof data !== "object") return data;
+  const normalizeTechnology = (technology: any) => {
+    if (!technology || typeof technology !== "object") return;
+    technology.ingredients = arrayOrEmpty(technology.ingredients);
+    technology.prerequisites = arrayOrEmpty(technology.prerequisites);
+    technology.missing_prerequisites = arrayOrEmpty(
+      technology.missing_prerequisites,
+    );
+  };
+  normalizeTechnology(data.current);
+  for (const key of ["queue", "available", "locked", "completed"]) {
+    data[key] = arrayOrEmpty(data[key]);
+    for (const technology of data[key]) normalizeTechnology(technology);
+  }
+  return data;
+}
+
+function normalizeEntityData(data: any) {
+  if (!data || typeof data !== "object") return data;
+  data.results = arrayOrEmpty(data.results);
+  for (const entity of data.results) {
+    entity.inventories = arrayOrEmpty(entity?.inventories);
+    entity.fluid_boxes = arrayOrEmpty(entity?.fluid_boxes);
+    for (const inventory of entity.inventories) {
+      inventory.purposes = arrayOrEmpty(inventory?.purposes);
+      inventory.items = arrayOrEmpty(inventory?.items);
+    }
+    for (const fluidBox of entity.fluid_boxes) {
+      fluidBox.connections = arrayOrEmpty(fluidBox?.connections);
+    }
+  }
+  return data;
+}
+
+function normalizePrototypeData(data: any) {
+  if (!data || typeof data !== "object") return data;
+  data.placeable_by = arrayOrEmpty(data.placeable_by);
+  data.fluid_boxes = arrayOrEmpty(data.fluid_boxes);
+  data.fuel_categories = arrayOrEmpty(data.fuel_categories);
+  for (const fluidBox of data.fluid_boxes) {
+    fluidBox.pipe_connections = arrayOrEmpty(fluidBox?.pipe_connections);
+    for (const connection of fluidBox.pipe_connections) {
+      connection.connection_category = arrayOrEmpty(connection?.connection_category);
+      connection.positions = arrayOrEmpty(connection?.positions);
+    }
+  }
+  return data;
 }
 
 function walkDelayMs(distance: number) {
@@ -183,6 +253,8 @@ const state: ServerState = {
   alwaysDayPending: false,
 };
 
+let saveCreationInProgress = false;
+
 function getRunningPid(): number | null {
   if (state.proc && !state.proc.killed && state.proc.pid) {
     return state.proc.pid;
@@ -205,7 +277,11 @@ if (existingPid && isPidRunning(existingPid)) {
 }
 
 function json(res: ServerResponse, status: number, data: unknown) {
-  const body = JSON.stringify(data);
+  const payload =
+    data && typeof data === "object" && !Array.isArray(data)
+      ? { schema_version: API_SCHEMA_VERSION, ...data }
+      : { schema_version: API_SCHEMA_VERSION, data };
+  const body = JSON.stringify(payload);
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
@@ -237,6 +313,69 @@ async function listSaves(): Promise<string[]> {
     .sort();
 }
 
+function normalizeSaveFilename(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("Missing save name");
+  }
+  const requested = value.trim();
+  const base = requested.toLowerCase().endsWith(".zip")
+    ? requested.slice(0, -4)
+    : requested;
+  if (
+    !base ||
+    base === "." ||
+    base === ".." ||
+    base.length > 200 ||
+    /[\\/\0\r\n]/.test(base)
+  ) {
+    throw new Error("Invalid save name");
+  }
+  return `${base}.zip`;
+}
+
+async function createSave(save: string): Promise<void> {
+  const savePath = path.join(SAVES_DIR, save);
+  await fs.mkdir(SAVES_DIR, { recursive: true });
+  await fs.access(MAP_GEN_SETTINGS);
+  try {
+    await fs.access(savePath);
+    throw new Error("Save already exists");
+  } catch (err: any) {
+    if (err?.message === "Save already exists") throw err;
+    if (err?.code !== "ENOENT") throw err;
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    const proc = spawn(
+      FACTORIO_BIN,
+      ["--create", savePath, "--map-gen-settings", MAP_GEN_SETTINGS],
+      { cwd: FACTORIO_DIR, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    proc.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    proc.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    proc.once("error", reject);
+    proc.once("close", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      const detail = stderr.trim() || stdout.trim();
+      reject(
+        new Error(
+          detail ||
+            `Factorio save creation failed${signal ? ` (${signal})` : ` (exit ${code})`}`,
+        ),
+      );
+    });
+  });
+}
+
 function rconConfigured(): boolean {
   return Boolean(RCON_HOST && RCON_PORT && RCON_PASSWORD);
 }
@@ -263,138 +402,6 @@ function rconStatus(): RconStatus {
   };
 }
 
-function worldInfoCommand(): string {
-  const parts = [
-    "/sc",
-    "local s=game.surfaces[1]",
-    "local function safe(get)",
-    "local ok,val=pcall(get)",
-    "if ok then return val end",
-    "return nil",
-    "end",
-    "local function esc(v)",
-    "if v==nil then return 'null' end",
-    "local t=type(v)",
-    'if t=="string" then',
-    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    'elseif t=="number" or t=="boolean" then',
-    "return tostring(v)",
-    "else",
-    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    "end",
-    "end",
-    "local enemy=game.forces['enemy']",
-    "local peaceful=safe(function() return game.map_settings.peaceful_mode end)",
-    "local evolution=nil",
-    "if enemy then",
-    "evolution=safe(function() return enemy.evolution_factor end)",
-    "if evolution==nil then evolution=safe(function() return enemy.get_evolution_factor() end) end",
-    "end",
-    "local min=-12",
-    "local max=12",
-    "local tile_out={}",
-    "for y=min,max do",
-    "for x=min,max do",
-    "local t=s.get_tile(x,y)",
-    "table.insert(tile_out,'{\"x\":'..x..',\"y\":'..y..',\"name\":'..esc(t.name)..'}')",
-    "end",
-    "end",
-    "local tiles_json='['..table.concat(tile_out,',')..']'",
-    "local entities=safe(function() return s.find_entities_filtered{area={{-12,-12},{13,13}}} end) or {}",
-    "local ent_out={}",
-    "for i=1,#entities do",
-    "local e=entities[i]",
-    "local force_name=e.force and e.force.name or nil",
-    "local health=safe(function() return e.health end)",
-    "local box=nil",
-    "local ok_box,proto=pcall(function() return e.prototype end)",
-    "if ok_box and proto and proto.collision_box then box=proto.collision_box end",
-    "local box_left=nil",
-    "local box_top=nil",
-    "local box_right=nil",
-    "local box_bottom=nil",
-    "if box and box.left_top and box.right_bottom then",
-    "box_left=e.position.x + box.left_top.x",
-    "box_top=e.position.y + box.left_top.y",
-    "box_right=e.position.x + box.right_bottom.x",
-    "box_bottom=e.position.y + box.right_bottom.y",
-    "end",
-    "local tile_x=math.floor(e.position.x)",
-    "local tile_y=math.floor(e.position.y)",
-    "local entry='{\"name\":'..esc(e.name)..',\"type\":'..esc(e.type)..',\"x\":'..esc(tile_x)",
-    "entry=entry..',\"y\":'..esc(tile_y)..',\"center_x\":'..esc(e.position.x)..',\"center_y\":'..esc(e.position.y)",
-    "entry=entry..',\"box_left\":'..esc(box_left)..',\"box_top\":'..esc(box_top)..',\"box_right\":'..esc(box_right)..',\"box_bottom\":'..esc(box_bottom)",
-    "entry=entry..',\"direction\":'..esc(e.direction)",
-    "entry=entry..',\"force\":'..esc(force_name)..',\"health\":'..esc(health)..'}'",
-    "table.insert(ent_out,entry)",
-    "end",
-    "local entities_json='['..table.concat(ent_out,',')..']'",
-    "local out={}",
-    "table.insert(out,'\"surface_name\":'..esc(s.name))",
-    "table.insert(out,'\"surface_index\":'..esc(s.index))",
-    "table.insert(out,'\"seed\":'..esc(s.map_gen_settings.seed))",
-    "table.insert(out,'\"peaceful_mode\":'..esc(peaceful))",
-    "table.insert(out,'\"tick\":'..esc(game.tick))",
-    "table.insert(out,'\"day\":'..esc(math.floor(game.tick/25000)))",
-    "table.insert(out,'\"daytime\":'..esc(s.daytime))",
-    "table.insert(out,'\"enemy_evolution\":'..esc(evolution or 0))",
-    "table.insert(out,'\"pollution\":'..esc(s.get_total_pollution()))",
-    "table.insert(out,'\"width\":'..esc(s.map_gen_settings.width))",
-    "table.insert(out,'\"height\":'..esc(s.map_gen_settings.height))",
-    "table.insert(out,'\"tiles\":'..tiles_json)",
-    "table.insert(out,'\"entities\":'..entities_json)",
-    "rcon.print('{'..table.concat(out,',')..'}')",
-  ];
-  return parts.join(" ");
-}
-
-function placeTestItemsCommand(): string {
-  const parts = [
-    "/sc",
-    "local s=game.surfaces[1]",
-    "local force=game.forces.player or game.forces[1]",
-    "local function place(name,x,y)",
-    "local ok,err=pcall(function()",
-    "s.create_entity{ name=name, position={x=x,y=y}, force=force }",
-    "end)",
-    "if ok then return {name=name,x=x,y=y,ok=true} end",
-    "return {name=name,x=x,y=y,ok=false,error=tostring(err)}",
-    "end",
-    "local results={}",
-    "table.insert(results,place('burner-mining-drill',-6,0))",
-    "table.insert(results,place('transport-belt',-3,0))",
-    "table.insert(results,place('burner-inserter',0,0))",
-    "table.insert(results,place('assembling-machine-1',4,0))",
-    "table.insert(results,place('iron-chest',8,0))",
-    "local chars=s.find_entities_filtered{name='character'}",
-    "if chars and #chars>0 then",
-    "pcall(function() chars[1].teleport({0,3}) end)",
-    "end",
-    "local function esc(v)",
-    "local t=type(v)",
-    'if t=="string" then',
-    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    'elseif t=="number" or t=="boolean" then',
-    "return tostring(v)",
-    "else",
-    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    "end",
-    "end",
-    "local out={}",
-    "table.insert(out,'\"placed\":[')",
-    "for i=1,#results do",
-    "local r=results[i]",
-    "local entry='{\"name\":'..esc(r.name)..',\"x\":'..r.x..',\"y\":'..r.y..',\"ok\":'..tostring(r.ok)",
-    "if r.error then entry=entry..',\"error\":'..esc(r.error) end",
-    "entry=entry..'}'",
-    "table.insert(out,entry)",
-    "end",
-    "table.insert(out,']')",
-    "rcon.print('{'..table.concat(out,',')..'}')",
-  ];
-  return parts.join(" ");
-}
-
 function clampInt(value: unknown, fallback: number, min: number, max: number) {
   const num = Number(value);
   if (!Number.isFinite(num)) return fallback;
@@ -403,6 +410,116 @@ function clampInt(value: unknown, fallback: number, min: number, max: number) {
 
 function luaString(value: string) {
   return `"${value.replace(/\\\\/g, "\\\\\\\\").replace(/\"/g, '\\\\"')}"`;
+}
+
+type BuildRequest = {
+  name: string;
+  anchor: { x: number; y: number };
+  direction?: number;
+};
+
+function agentNativeBuildCommand(item: BuildRequest, dryRun = false): string {
+  const direction = item.direction ?? 0;
+  const parts = [
+    "/sc",
+    "local p=game.players[1]",
+    "local function done(v) rcon.print(helpers.table_to_json(v)) end",
+    "if not p or not p.character then done{ok=false,error='no_character'} return end",
+    `local name=${luaString(item.name)}`,
+    `local anchor_x=${Number(item.anchor.x)}`,
+    `local anchor_y=${Number(item.anchor.y)}`,
+    `local direction=${Number(direction)}`,
+    `local dry_run=${dryRun ? "true" : "false"}`,
+    "local proto=prototypes.entity[name]",
+    "if not proto then done{ok=false,error='unknown_entity',name=name} return end",
+    "local place_item=nil local place_count=1 for _,item in pairs(proto.items_to_place_this or {}) do place_item=item.name place_count=item.count or 1 break end",
+    "if not place_item then done{ok=false,error='not_player_placeable',name=name} return end",
+    "if direction~=0 and direction~=4 and direction~=8 and direction~=12 then done{ok=false,error='invalid_direction',direction=direction} return end",
+    "local width=proto.tile_width or math.ceil(proto.collision_box.right_bottom.x-proto.collision_box.left_top.x)",
+    "local height=proto.tile_height or math.ceil(proto.collision_box.right_bottom.y-proto.collision_box.left_top.y)",
+    "if direction==4 or direction==12 then width,height=height,width end",
+    "local x=anchor_x+width/2 local y=anchor_y+height/2",
+    "local footprint={min_x=anchor_x,min_y=anchor_y,max_x=anchor_x+width-1,max_y=anchor_y+height-1,width=width,height=height}",
+    "local function diagnostics()",
+    "local terrain={tile_names={}} local collision={possible_blockers={}} local d={alignment={valid=(anchor_x==math.floor(anchor_x) and anchor_y==math.floor(anchor_y)),required='integer_top_left_tile'},required_footprint=footprint,terrain=terrain,collision=collision,nearest_valid_positions={}}",
+    "local dx=x-p.position.x local dy=y-p.position.y d.reachable=dx*dx+dy*dy<=p.build_distance*p.build_distance",
+    "local tile_names={} for ty=anchor_y,anchor_y+height-1 do for tx=anchor_x,anchor_x+width-1 do local tile=p.surface.get_tile(tx,ty) if not tile_names[tile.name] then tile_names[tile.name]=true table.insert(terrain.tile_names,tile.name) end end end",
+    "local nearby=p.surface.find_entities_filtered{area={{anchor_x,anchor_y},{anchor_x+width,anchor_y+height}}} or {}",
+    "for _,e in pairs(nearby) do if e.valid and e~=p.character and e.type~='resource' then table.insert(collision.possible_blockers,{name=e.name,type=e.type,center={x=e.position.x,y=e.position.y}}) end end",
+    "for radius=1,6 do for oy=-radius,radius do for ox=-radius,radius do if math.abs(ox)==radius or math.abs(oy)==radius then local ax=anchor_x+ox local ay=anchor_y+oy local cx=ax+width/2 local cy=ay+height/2 if p.surface.can_place_entity{name=name,position={cx,cy},direction=direction,force=p.force,build_check_type=defines.build_check_type.manual} then table.insert(d.nearest_valid_positions,{anchor={x=ax,y=ay},center={x=cx,y=cy}}) if #d.nearest_valid_positions>=8 then return d end end end end end end",
+    "return d end",
+    "if dry_run then local can_place=p.surface.can_place_entity{name=name,position={x=x,y=y},direction=direction,force=p.force,build_check_type=defines.build_check_type.manual} done{ok=true,can_place=can_place,requested_anchor={x=anchor_x,y=anchor_y},intended_center={x=x,y=y},direction=direction,diagnostics=diagnostics()} return end",
+    "local dx=x-p.position.x",
+    "local dy=y-p.position.y",
+    "if dx*dx+dy*dy > p.build_distance*p.build_distance then done{ok=false,error='out_of_reach',requested_anchor={x=anchor_x,y=anchor_y},intended_center={x=x,y=y},diagnostics=diagnostics()} return end",
+    "local selected=p.cursor_stack and p.cursor_stack.valid_for_read and p.cursor_stack.name==place_item",
+    "if not selected then p.clear_cursor() end",
+    "if not selected then local prototype=prototypes.item[place_item] if prototype then selected=p.pipette(prototype,nil,false) end end",
+    "if not selected or not p.cursor_stack or not p.cursor_stack.valid_for_read or p.cursor_stack.name~=place_item then done{ok=false,error='missing_item',name=name,required_item={name=place_item,count=place_count}} return end",
+    "local params={position={x=x,y=y},direction=direction,build_mode=defines.build_mode.normal,skip_fog_of_war=false}",
+    "if not p.can_build_from_cursor(params) then local d=diagnostics() p.clear_cursor() done{ok=false,error='cannot_build',requested_anchor={x=anchor_x,y=anchor_y},intended_center={x=x,y=y},direction=direction,diagnostics=d,cursor_cleared=true} return end",
+    "p.build_from_cursor(params)",
+    "p.clear_cursor()",
+    "local entities=p.surface.find_entities_filtered{position={x,y},name=name} or {}",
+    "local e=entities[1]",
+    "if not e then done{ok=false,error='build_result_not_found',requested_anchor={x=anchor_x,y=anchor_y},intended_center={x=x,y=y},cursor_cleared=true} return end",
+    "done{ok=true,name=name,placed_with_item=place_item,requested_anchor={x=anchor_x,y=anchor_y},actual_center={x=e.position.x,y=e.position.y},occupied_tiles=footprint,direction=e.direction,cursor_cleared=true}",
+  ];
+  return parts.join(" ");
+}
+
+function agentBuildDestinationCommand(item: BuildRequest): string {
+  const direction = item.direction ?? 0;
+  return [
+    "/sc", "local p=game.players[1]", "local function done(v) rcon.print(helpers.table_to_json(v)) end",
+    "if not p or not p.character then done{ok=false,error='no_character'} return end",
+    `local name=${luaString(item.name)}`, `local ax=${item.anchor.x}`, `local ay=${item.anchor.y}`, `local dir=${direction}`,
+    "local proto=prototypes.entity[name] if not proto then done{ok=false,error='unknown_entity'} return end",
+    "local w=proto.tile_width local h=proto.tile_height if dir==4 or dir==12 then w,h=h,w end local cx=ax+w/2 local cy=ay+h/2",
+    "local margin=1 local offsets={{-(w/2+margin),0},{w/2+margin,0},{0,-(h/2+margin)},{0,h/2+margin},{-(w/2+margin),-(h/2+margin)},{w/2+margin,-(h/2+margin)},{-(w/2+margin),h/2+margin},{w/2+margin,h/2+margin}}",
+    "local best=nil local best_d=nil for _,o in pairs(offsets) do local tx=cx+o[1] local ty=cy+o[2] local pos=p.surface.find_non_colliding_position('character',{tx,ty},0.75,0.1) if pos then local reach_dx=pos.x-cx local reach_dy=pos.y-cy if reach_dx*reach_dx+reach_dy*reach_dy<=p.build_distance*p.build_distance then local dx=pos.x-p.position.x local dy=pos.y-p.position.y local d=dx*dx+dy*dy if not best_d or d<best_d then best=pos best_d=d end end end end",
+    "if not best then done{ok=false,error='no_reachable_staging_position'} return end done{ok=true,position=best,center={x=cx,y=cy}}",
+  ].join(" ");
+}
+
+function agentMapCommand(params: { x: number; y: number; radius: number }): string {
+  const minX = params.x - params.radius;
+  const maxX = params.x + params.radius;
+  const minY = params.y - params.radius;
+  const maxY = params.y + params.radius;
+  return [
+    "/sc",
+    "local s=game.surfaces[1]",
+    "local force=game.forces.player or game.forces[1]",
+    "local function esc(v) if v==nil then return 'null' end if type(v)=='string' then return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"' end return tostring(v) end",
+    `local min_x=${minX}`, `local max_x=${maxX}`, `local min_y=${minY}`, `local max_y=${maxY}`,
+    "local chunks={} local symbols={}",
+    "local cminx=math.floor(min_x/32) local cmaxx=math.floor(max_x/32) local cminy=math.floor(min_y/32) local cmaxy=math.floor(max_y/32)",
+    "for cy=cminy,cmaxy do for cx=cminx,cmaxx do",
+    "local charted=force.is_chunk_charted(s,{x=cx,y=cy})",
+    "table.insert(chunks,'{\"x\":'..cx..',\"y\":'..cy..',\"charted\":'..tostring(charted)..'}')",
+    "if charted then local ents=s.find_entities_filtered{area={{cx*32,cy*32},{cx*32+32,cy*32+32}}} or {} for i=1,#ents do local e=ents[i] if e.valid and (e.type=='resource' or e.force==force) then table.insert(symbols,'{\"name\":'..esc(e.name)..',\"type\":'..esc(e.type)..',\"x\":'..math.floor(e.position.x)..',\"y\":'..math.floor(e.position.y)..'}') end end end",
+    "end end",
+    "rcon.print('{\"window\":{\"min_x\":'..min_x..',\"min_y\":'..min_y..',\"max_x\":'..max_x..',\"max_y\":'..max_y..'},\"chunks\":['..table.concat(chunks,',')..'],\"symbols\":['..table.concat(symbols,',')..']}')",
+  ].join(" ");
+}
+
+function agentChartedResourcesCommand(params: { x: number; y: number; radius: number }): string {
+  const minX = params.x - params.radius;
+  const maxX = params.x + params.radius;
+  const minY = params.y - params.radius;
+  const maxY = params.y + params.radius;
+  return [
+    "/sc", "local s=game.surfaces[1]", "local force=game.forces.player or game.forces[1]",
+    `local center_x=${params.x}`, `local center_y=${params.y}`, `local min_x=${minX}`, `local max_x=${maxX}`, `local min_y=${minY}`, `local max_y=${maxY}`,
+    "local found=s.find_entities_filtered{area={{min_x,min_y},{max_x+1,max_y+1}},type='resource'} or {} local cells={} local total=0",
+    "for _,e in pairs(found) do local x=math.floor(e.position.x) local y=math.floor(e.position.y) if force.is_chunk_charted(s,{x=math.floor(x/32),y=math.floor(y/32)}) then local key=e.name..':'..x..':'..y cells[key]={name=e.name,x=x,y=y,amount=e.amount or 0} total=total+1 end end",
+    "local visited={} local patches={} local neighbours={{-1,-1},{0,-1},{1,-1},{-1,0},{1,0},{-1,1},{0,1},{1,1}}",
+    "for key,start in pairs(cells) do if not visited[key] then local queue={start} visited[key]=true local head=1 local count=0 local amount=0 local sum_x=0 local sum_y=0 local minpx=start.x local maxpx=start.x local minpy=start.y local maxpy=start.y while head<=#queue do local cell=queue[head] head=head+1 count=count+1 amount=amount+cell.amount sum_x=sum_x+cell.x sum_y=sum_y+cell.y minpx=math.min(minpx,cell.x) maxpx=math.max(maxpx,cell.x) minpy=math.min(minpy,cell.y) maxpy=math.max(maxpy,cell.y) for _,o in pairs(neighbours) do local nk=cell.name..':'..(cell.x+o[1])..':'..(cell.y+o[2]) local next_cell=cells[nk] if next_cell and not visited[nk] then visited[nk]=true table.insert(queue,next_cell) end end end local cx=sum_x/count local cy=sum_y/count table.insert(patches,{resource=start.name,tile_count=count,amount=amount,center={x=cx,y=cy},bounds={min_x=minpx,min_y=minpy,max_x=maxpx,max_y=maxpy},distance=math.sqrt((cx-center_x)^2+(cy-center_y)^2)}) end end",
+    "table.sort(patches,function(a,b) if a.distance==b.distance then return a.resource<b.resource end return a.distance<b.distance end) local patch_count=#patches local nearest={} for _,patch in ipairs(patches) do if not nearest[patch.resource] then nearest[patch.resource]=patch end end while #patches>200 do table.remove(patches) end",
+    "local shoreline={} local shoreline_radius=math.min(128,math.max(math.abs(max_x-center_x),math.abs(max_y-center_y))) local shore_min_x=center_x-shoreline_radius local shore_max_x=center_x+shoreline_radius local shore_min_y=center_y-shoreline_radius local shore_max_y=center_y+shoreline_radius local dirs={{0,-1,0,'north'},{1,0,4,'east'},{0,1,8,'south'},{-1,0,12,'west'}} for y=shore_min_y,shore_max_y do for x=shore_min_x,shore_max_x do if force.is_chunk_charted(s,{x=math.floor(x/32),y=math.floor(y/32)}) then local land=s.get_tile(x,y) if not string.find(land.name,'water',1,true) then for _,d in pairs(dirs) do local water=s.get_tile(x+d[1],y+d[2]) if string.find(water.name,'water',1,true) then table.insert(shoreline,{land_tile={x=x,y=y,name=land.name},water_tile={x=x+d[1],y=y+d[2],name=water.name},facing=d[4],direction=d[3],distance=math.sqrt((x-center_x)^2+(y-center_y)^2)}) end end end end end end table.sort(shoreline,function(a,b) return a.distance<b.distance end) while #shoreline>64 do table.remove(shoreline) end",
+    "rcon.print(helpers.table_to_json{patches=patches,patch_count=patch_count,patches_truncated=patch_count>#patches,nearest_by_resource=nearest,shoreline_candidates=shoreline,shoreline_scan_radius=shoreline_radius,total_resource_tiles=total,charted_only=true})",
+  ].join(" ");
 }
 
 function agentWorldCommand(params: {
@@ -419,6 +536,7 @@ function agentWorldCommand(params: {
   const parts = [
     "/sc",
     "local s=game.surfaces[1]",
+    "local force=game.forces.player or game.forces[1]",
     "local function esc(v)",
     "if v==nil then return 'null' end",
     "local t=type(v)",
@@ -443,9 +561,8 @@ function agentWorldCommand(params: {
     "for y=min_y,max_y do",
     "for x=min_x,max_x do",
     "tiles_total=tiles_total+1",
-    "local t=s.get_tile(x,y)",
-    "table.insert(tiles_out,'{\"x\":'..x..',\"y\":'..y..',\"name\":'..esc(t.name)..'}')",
-    "tiles_included=tiles_included+1",
+    "local charted=force.is_chunk_charted(s,{x=math.floor(x/32),y=math.floor(y/32)})",
+    "if charted then local t=s.get_tile(x,y) table.insert(tiles_out,'{\"x\":'..x..',\"y\":'..y..',\"name\":'..esc(t.name)..'}') tiles_included=tiles_included+1 end",
     "end",
     "end",
     "end",
@@ -459,6 +576,8 @@ function agentWorldCommand(params: {
     "entities_total=#entities",
     "for i=1,#entities do",
     "local e=entities[i]",
+    "local charted=force.is_chunk_charted(s,{x=math.floor(e.position.x/32),y=math.floor(e.position.y/32)})",
+    "if charted then",
     "local force_name=e.force and e.force.name or nil",
     "local health=e.health",
     "local box=nil",
@@ -485,6 +604,7 @@ function agentWorldCommand(params: {
     "entities_included=entities_included+1",
     "end",
     "end",
+    "end",
     "local out={}",
     "table.insert(out,'\"window\":{\"min_x\":'..min_x..',\"min_y\":'..min_y..',\"max_x\":'..max_x..',\"max_y\":'..max_y..'}')",
     "table.insert(out,'\"tiles\":['..table.concat(tiles_out,',')..']')",
@@ -493,6 +613,27 @@ function agentWorldCommand(params: {
     "rcon.print('{'..table.concat(out,',')..'}')",
   ];
   return parts.join(" ");
+}
+
+function agentCompactWorldCommand(params: {
+  x: number;
+  y: number;
+  radius: number;
+  includeTiles: boolean;
+  includeEntities: boolean;
+}): string {
+  const minX = params.x - params.radius;
+  const maxX = params.x + params.radius;
+  const minY = params.y - params.radius;
+  const maxY = params.y + params.radius;
+  return [
+    "/sc", "local s=game.surfaces[1]", "local force=game.forces.player or game.forces[1]",
+    `local min_x=${minX}`, `local max_x=${maxX}`, `local min_y=${minY}`, `local max_y=${maxY}`,
+    `local include_tiles=${params.includeTiles ? "true" : "false"}`, `local include_entities=${params.includeEntities ? "true" : "false"}`,
+    "local rows={} local tile_total=0 local tile_included=0 if include_tiles then for y=min_y,max_y do local runs={} local current=nil for x=min_x,max_x do tile_total=tile_total+1 local charted=force.is_chunk_charted(s,{x=math.floor(x/32),y=math.floor(y/32)}) local name=charted and s.get_tile(x,y).name or 'uncharted' if charted then tile_included=tile_included+1 end if current and current.name==name then current.length=current.length+1 else current={x=x,length=1,name=name} table.insert(runs,current) end end table.insert(rows,{y=y,runs=runs}) end end",
+    "local entities={} local entity_total=0 if include_entities then local found=s.find_entities_filtered{area={{min_x,min_y},{max_x+1,max_y+1}}} or {} for _,e in pairs(found) do if force.is_chunk_charted(s,{x=math.floor(e.position.x/32),y=math.floor(e.position.y/32)}) then entity_total=entity_total+1 local health=nil pcall(function() health=e.health end) local cb=e.prototype.collision_box table.insert(entities,{name=e.name,type=e.type,center={x=e.position.x,y=e.position.y},occupied_tile={x=math.floor(e.position.x),y=math.floor(e.position.y)},collision_bounds={left=e.position.x+cb.left_top.x,top=e.position.y+cb.left_top.y,right=e.position.x+cb.right_bottom.x,bottom=e.position.y+cb.right_bottom.y},direction=e.direction,force=e.force and e.force.name or nil,health=health}) end end end",
+    "rcon.print(helpers.table_to_json{window={min_x=min_x,min_y=min_y,max_x=max_x,max_y=max_y},terrain={encoding='rle_rows',rows=rows},entities=entities,counts={tiles_total=tile_total,tiles_included=tile_included,entities_included=entity_total},charted_only=true})",
+  ].join(" ");
 }
 
 function agentPlayerCommand(params: {
@@ -523,10 +664,10 @@ function agentPlayerCommand(params: {
     "if not inv or not inv.valid then return end",
     "local out={}",
     "for i=1,#inv do",
-    "inv_total=inv_total+1",
-    "if inv_included < inv_limit then",
     "local stack=inv[i]",
     "if stack and stack.valid_for_read then",
+    "inv_total=inv_total+1",
+    "if inv_included < inv_limit then",
     "local durability=nil",
     "local ammo=nil",
     "local ok_dur, dur=pcall(function() return stack.durability end)",
@@ -588,6 +729,9 @@ function agentPlayerCommand(params: {
     "table.insert(pf,'\"direction\":'..esc(direction))",
     "table.insert(pf,'\"health\":'..esc(player.character and player.character.health))",
     "table.insert(pf,'\"energy\":'..esc(player.character and player.character.energy))",
+    "local cursor='null'",
+    "if player.cursor_stack and player.cursor_stack.valid_for_read then cursor='{\"name\":'..esc(player.cursor_stack.name)..',\"count\":'..player.cursor_stack.count..'}' end",
+    "table.insert(pf,'\"cursor\":'..cursor)",
     "table.insert(pf,'\"inventories\":['..table.concat(inventories,',')..']')",
     "table.insert(pf,'\"equipment\":['..table.concat(equipment_out,',')..']')",
     "table.insert(pf,'\"crafting_queue\":['..table.concat(craft_out,',')..']')",
@@ -599,60 +743,29 @@ function agentPlayerCommand(params: {
   return parts.join(" ");
 }
 
-function agentResearchCommand(params: { limit: number }): string {
-  const parts = [
-    "/sc",
-    "local force=game.forces.player or game.forces[1]",
-    "local function esc(v)",
-    "if v==nil then return 'null' end",
-    "local t=type(v)",
-    'if t==\"string\" then',
-    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    'elseif t==\"number\" or t==\"boolean\" then',
-    "return tostring(v)",
-    "else",
-    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
+function agentResearchCommand(params: {
+  availableLimit: number;
+  lockedLimit: number;
+  completedLimit: number;
+}): string {
+  return [
+    "/sc", "local force=game.forces.player or game.forces[1]",
+    `local available_limit=${params.availableLimit}`, `local locked_limit=${params.lockedLimit}`, `local completed_limit=${params.completedLimit}`,
+    "local function descriptor(tech,status)",
+    "local ingredients={} for _,ingredient in pairs(tech.research_unit_ingredients or {}) do table.insert(ingredients,{name=ingredient.name,amount=ingredient.amount}) end table.sort(ingredients,function(a,b) return a.name<b.name end)",
+    "local prerequisites={} local missing={} for name,p in pairs(tech.prerequisites or {}) do table.insert(prerequisites,name) if not p.researched then table.insert(missing,name) end end table.sort(prerequisites) table.sort(missing)",
+    "return {name=tech.name,level=tech.level,status=status,enabled=tech.enabled,researched=tech.researched,unit_count=tech.research_unit_count,unit_time_seconds=tech.research_unit_energy/60,unit_energy_ticks=tech.research_unit_energy,ingredients=ingredients,prerequisites=prerequisites,missing_prerequisites=missing,saved_progress=tech.saved_progress}",
     "end",
-    "end",
-    `local limit=${params.limit}`,
-    "local available_out={}",
-    "local available_total=0",
-    "local available_included=0",
-    "for name,tech in pairs(force.technologies) do",
-    "if tech.enabled and not tech.researched and #tech.research_unit_ingredients > 0 then",
-    "local prereqs_met=true",
-    "for _,p in pairs(tech.prerequisites) do",
-    "if not p.researched then prereqs_met=false break end",
-    "end",
-    "if prereqs_met then",
-    "available_total=available_total+1",
-    "if available_included < limit then",
-    "table.insert(available_out,'{\"name\":'..esc(name)..',\"level\":'..esc(tech.level)..'}')",
-    "available_included=available_included+1",
-    "end",
-    "end",
-    "end",
-    "end",
-    "local queue_out={}",
-    "if force.research_queue and #force.research_queue > 0 then",
-    "for i=1,#force.research_queue do",
-    "local tech=force.research_queue[i]",
-    "table.insert(queue_out,'{\"name\":'..esc(tech.name)..',\"level\":'..esc(tech.level)..'}')",
-    "end",
-    "end",
-    "local current=nil",
-    "if force.current_research then",
-    "local tech=force.current_research",
-    "current='{\"name\":'..esc(tech.name)..',\"level\":'..esc(tech.level)..',\"progress\":'..esc(force.research_progress)..'}'",
-    "end",
-    "local out={}",
-    "table.insert(out,'\"current\":'..(current or 'null'))",
-    "table.insert(out,'\"queue\":['..table.concat(queue_out,',')..']')",
-    "table.insert(out,'\"available\":['..table.concat(available_out,',')..']')",
-    "table.insert(out,'\"counts\":{\"available_total\":'..available_total..',\"available_included\":'..available_included..'}')",
-    "rcon.print('{'..table.concat(out,',')..'}')",
-  ];
-  return parts.join(" ");
+    "local available={} local locked={} local completed={} local counts={available=0,locked=0,completed=0}",
+    "local names={} for name,_ in pairs(force.technologies) do table.insert(names,name) end table.sort(names)",
+    "for _,name in ipairs(names) do local tech=force.technologies[name] local has_units=#(tech.research_unit_ingredients or {})>0 local missing=false for _,p in pairs(tech.prerequisites or {}) do if not p.researched then missing=true break end end",
+    "if tech.researched then counts.completed=counts.completed+1 if #completed<completed_limit then table.insert(completed,descriptor(tech,'completed')) end",
+    "elseif tech.enabled and has_units and not missing then counts.available=counts.available+1 if #available<available_limit then table.insert(available,descriptor(tech,'available')) end",
+    "else counts.locked=counts.locked+1 if #locked<locked_limit then table.insert(locked,descriptor(tech,'locked')) end end end",
+    "local queue={} if force.research_queue then for _,tech in ipairs(force.research_queue) do table.insert(queue,descriptor(tech,'queued')) end end",
+    "local current=nil if force.current_research then current=descriptor(force.current_research,'researching') current.progress=force.research_progress end",
+    "rcon.print(helpers.table_to_json{current=current,queue=queue,available=available,locked=locked,completed=completed,counts={available_total=counts.available,available_included=#available,locked_total=counts.locked,locked_included=#locked,completed_total=counts.completed,completed_included=#completed}})",
+  ].join(" ");
 }
 
 function agentRecipesCommand(params: {
@@ -839,7 +952,9 @@ function agentBuildCommand(
   return parts.join(" ");
 }
 
-function agentMineCommand(targets: Array<{ x: number; y: number }>): string {
+type EntityTarget = { x: number; y: number; kind?: "resource" | "entity"; name?: string };
+
+function agentMineCommand(targets: EntityTarget[]): string {
   const parts = [
     "/sc",
     "local s=game.surfaces[1]",
@@ -857,25 +972,9 @@ function agentMineCommand(targets: Array<{ x: number; y: number }>): string {
     "end",
     "end",
     "local results={}",
-    "local function find_entity(x,y)",
-    "local ents=s.find_entities_filtered{position={x,y}} or {}",
-    "if #ents > 0 then return ents[1] end",
-    "local area={{x-0.5,y-0.5},{x+0.5,y+0.5}}",
-    "ents=s.find_entities_filtered{area=area} or {}",
-    "for i=1,#ents do",
-    "local cand=ents[i]",
-    "if cand and cand.valid and cand.minable then return cand end",
-    "end",
-    "return nil",
-    "end",
+    "local function find_entity(x,y,kind,wanted_name) local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.minable and cand.type~='character' and cand.type~='item-entity' and cand.type~='corpse' and (not kind or (kind=='resource' and cand.type=='resource') or (kind=='entity' and cand.type~='resource')) and (not wanted_name or cand.name==wanted_name) then local dx=cand.position.x-(x+0.5) local dy=cand.position.y-(y+0.5) local score=(cand.type=='resource' and 0 or 100)+(wanted_name and 1000 or 0)-dx*dx-dy*dy table.insert(candidates,{entity=cand,score=score,key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end) return candidates[1] and candidates[1].entity or nil end",
     "local function ensure_reach(entity)",
     "if not player.character then return false,'no_character' end",
-    "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
-    "local target_pos=entity.position",
-    "local safe_pos=s.find_non_colliding_position('character', target_pos, 6, 0.5)",
-    "if safe_pos then",
-    "player.teleport(safe_pos)",
-    "end",
     "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
     "return false,'out_of_reach'",
     "end",
@@ -897,9 +996,9 @@ function agentMineCommand(targets: Array<{ x: number; y: number }>): string {
     "if total <= 0 then total = 1 end",
     "return total",
     "end",
-    "local function mine(x,y)",
-    "local e=find_entity(x,y)",
-    "if not e then return {x=x,y=y,ok=false,error='no_entity'} end",
+    "local function mine(x,y,kind,wanted_name)",
+    "local e=find_entity(x,y,kind,wanted_name)",
+    "if not e then return {x=x,y=y,requested_tile={x=x,y=y},ok=false,error=kind=='resource' and 'no_resource' or 'no_entity'} end",
     "local ename=e.name",
     "if not e.minable then return {x=x,y=y,name=ename,ok=false,error='not_minable'} end",
     "local can_reach,reach_err=ensure_reach(e)",
@@ -911,7 +1010,7 @@ function agentMineCommand(targets: Array<{ x: number; y: number }>): string {
     "end",
   ];
   for (const target of targets) {
-    parts.push(`table.insert(results,mine(${target.x},${target.y}))`);
+    parts.push(`table.insert(results,mine(${target.x},${target.y},${target.kind ? luaString(target.kind) : "nil"},${target.name ? luaString(target.name) : "nil"}))`);
   }
   parts.push(
     "local out={}",
@@ -920,6 +1019,7 @@ function agentMineCommand(targets: Array<{ x: number; y: number }>): string {
     "local entry='{\"x\":'..r.x..',\"y\":'..r.y..',\"ok\":'..tostring(r.ok)",
     "if r.name then entry=entry..',\"name\":'..esc(r.name) end",
     "if r.error then entry=entry..',\"error\":'..esc(r.error) end",
+    "if r.mined_count then entry=entry..',\"mined_count\":'..esc(r.mined_count) end",
     "entry=entry..'}'",
     "table.insert(out,entry)",
     "end",
@@ -929,7 +1029,7 @@ function agentMineCommand(targets: Array<{ x: number; y: number }>): string {
   return parts.join(" ");
 }
 
-function agentMineProbeCommand(target: { x: number; y: number }): string {
+function agentMineProbeCommand(target: EntityTarget): string {
   const parts = [
     "/sc",
     "local s=game.surfaces[1]",
@@ -946,21 +1046,13 @@ function agentMineProbeCommand(target: { x: number; y: number }): string {
     "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
     "end",
     "end",
-    "local function find_entity(x,y)",
-    "local ents=s.find_entities_filtered{position={x,y}} or {}",
-    "if #ents > 0 then return ents[1] end",
-    "local area={{x-0.5,y-0.5},{x+0.5,y+0.5}}",
-    "ents=s.find_entities_filtered{area=area} or {}",
-    "for i=1,#ents do",
-    "local cand=ents[i]",
-    "if cand and cand.valid and cand.minable then return cand end",
-    "end",
-    "return nil",
-    "end",
+    `local kind=${target.kind ? luaString(target.kind) : "nil"}`,
+    `local wanted_name=${target.name ? luaString(target.name) : "nil"}`,
+    "local function find_entity(x,y) local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.minable and cand.type~='character' and cand.type~='item-entity' and cand.type~='corpse' and (not kind or (kind=='resource' and cand.type=='resource') or (kind=='entity' and cand.type~='resource')) and (not wanted_name or cand.name==wanted_name) then local dx=cand.position.x-(x+0.5) local dy=cand.position.y-(y+0.5) local score=(cand.type=='resource' and 0 or 100)+(wanted_name and 1000 or 0)-dx*dx-dy*dy table.insert(candidates,{entity=cand,score=score,key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end) return candidates[1] and candidates[1].entity or nil end",
     `local target_x=${target.x}`,
     `local target_y=${target.y}`,
     "local e=find_entity(target_x,target_y)",
-    "if not e then rcon.print('{\"error\":\"no_entity\"}') return end",
+    "if not e then rcon.print(helpers.table_to_json{error=kind=='resource' and 'no_resource' or 'no_entity'}) return end",
     "local out={}",
     "table.insert(out,'\"player\":{\"x\":'..esc(player.position.x)..',\"y\":'..esc(player.position.y)..'}')",
     "table.insert(out,'\"entity\":{\"name\":'..esc(e.name)..',\"x\":'..esc(e.position.x)..',\"y\":'..esc(e.position.y)..',\"minable\":'..esc(e.minable)..'}')",
@@ -977,6 +1069,31 @@ function agentPlayerPositionCommand(): string {
     "rcon.print('{\"player\":{\"x\":'..player.position.x..',\"y\":'..player.position.y..'}}')",
   ];
   return parts.join(" ");
+}
+
+function agentInteractionDestinationCommand(target: EntityTarget) {
+  return [
+    "/sc", "local s=game.surfaces[1]", "local p=game.players[1]", "local function done(v) rcon.print(helpers.table_to_json(v)) end",
+    "if not p or not p.character then done{ok=false,error='no_character'} return end",
+    `local x=${target.x}`, `local y=${target.y}`, `local kind=${target.kind ? luaString(target.kind) : "nil"}`, `local wanted_name=${target.name ? luaString(target.name) : "nil"}`,
+    "local found=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,candidate in pairs(found) do if candidate.valid and candidate~=p.character and candidate.type~='item-entity' and candidate.type~='corpse' and (not kind or (kind=='resource' and candidate.type=='resource') or (kind=='entity' and candidate.type~='resource')) and (not wanted_name or candidate.name==wanted_name) then local dx=candidate.position.x-(x+0.5) local dy=candidate.position.y-(y+0.5) local score=(candidate.type=='resource' and 0 or 100)+(wanted_name and 1000 or 0)-dx*dx-dy*dy table.insert(candidates,{entity=candidate,score=score,key=candidate.name..':'..candidate.position.x..':'..candidate.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end) local e=candidates[1] and candidates[1].entity or nil if not e then done{ok=false,error=kind=='resource' and 'no_resource' or 'no_entity'} return end",
+    "if p.can_reach_entity(e) then done{ok=true,position={x=p.position.x,y=p.position.y},entity={name=e.name,center={x=e.position.x,y=e.position.y}}} return end",
+    "local pos=s.find_non_colliding_position('character',e.position,math.max(1,p.reach_distance-0.25),0.1) if not pos then done{ok=false,error='no_reachable_staging_position'} return end",
+    "done{ok=true,position={x=pos.x,y=pos.y},entity={name=e.name,center={x=e.position.x,y=e.position.y}}}",
+  ].join(" ");
+}
+
+async function moveNearEntity(target: EntityTarget) {
+  const destination = parseRconJson<any>(
+    await rconCommand(agentInteractionDestinationCommand(target)),
+    "RCON interaction destination returned invalid JSON",
+  );
+  if (!destination?.ok) return destination;
+  const movement = await movePlayerTo(
+    Number(destination.position.x),
+    Number(destination.position.y),
+  );
+  return { ...movement, entity: destination.entity };
 }
 
 function agentEntityProbeCommand(target: { x: number; y: number }): string {
@@ -996,17 +1113,7 @@ function agentEntityProbeCommand(target: { x: number; y: number }): string {
     "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
     "end",
     "end",
-    "local function find_entity(x,y)",
-    "local ents=s.find_entities_filtered{position={x,y}} or {}",
-    "if #ents > 0 then return ents[1] end",
-    "local area={{x-0.5,y-0.5},{x+0.5,y+0.5}}",
-    "ents=s.find_entities_filtered{area=area} or {}",
-    "for i=1,#ents do",
-    "local cand=ents[i]",
-    "if cand and cand.valid then return cand end",
-    "end",
-    "return nil",
-    "end",
+    "local function find_entity(x,y) local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.type~='character' and cand.type~='item-entity' and cand.type~='corpse' then local dx=cand.position.x-(x+0.5) local dy=cand.position.y-(y+0.5) local score=(cand.type=='resource' and 0 or 100)-dx*dx-dy*dy table.insert(candidates,{entity=cand,score=score,key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end) return candidates[1] and candidates[1].entity or nil end",
     `local target_x=${target.x}`,
     `local target_y=${target.y}`,
     "local e=find_entity(target_x,target_y)",
@@ -1040,6 +1147,79 @@ function agentMoveCommand(target: { x: number; y: number }): string {
   return parts.join(" ");
 }
 
+function agentMoveStepCommand(params: {
+  x: number;
+  y: number;
+  direction: number;
+}): string {
+  return [
+    "/sc",
+    "local s=game.surfaces[1]",
+    "local player=game.players[1]",
+    'if not player or not player.character then rcon.print(\'{"ok":false,"error":"no_character"}\') return end',
+    `local x=${params.x}`,
+    `local y=${params.y}`,
+    `local direction=${params.direction}`,
+    "local pos=s.find_non_colliding_position('character',{x=x,y=y},0.75,0.1)",
+    "if not pos then rcon.print('{\"ok\":false,\"error\":\"blocked\"}') return end",
+    "if math.abs(pos.x-x)>0.76 or math.abs(pos.y-y)>0.76 then rcon.print('{\"ok\":false,\"error\":\"blocked\"}') return end",
+    "player.teleport(pos)",
+    "player.character.direction=direction",
+    "rcon.print('{\"ok\":true,\"x\":'..pos.x..',\"y\":'..pos.y..'}')",
+  ].join(" ");
+}
+
+function directionForVector(dx: number, dy: number) {
+  if (dx === 0 && dy === 0) return 0;
+  const octant = Math.round(Math.atan2(dx, -dy) / (Math.PI / 4));
+  return ((octant % 8) + 8) % 8 * 2;
+}
+
+async function movePlayerTo(targetX: number, targetY: number) {
+  const probe = parseRconJson<any>(
+    await rconCommand(agentPlayerPositionCommand()),
+    "RCON player-position probe returned invalid JSON",
+  );
+  const start = probe?.player;
+  if (!start || !Number.isFinite(start.x) || !Number.isFinite(start.y)) {
+    return { ok: false, error: probe?.error || "probe_failed" };
+  }
+  const distance = Math.hypot(targetX - start.x, targetY - start.y);
+  const steps = Math.max(1, Math.ceil(distance / 0.75));
+  const stepDelayMs = walkDelayMs(distance) / steps;
+  let movedX = start.x;
+  let movedY = start.y;
+  for (let step = 1; step <= steps; step++) {
+    if (stepDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, stepDelayMs));
+    const fraction = step / steps;
+    const nextX = start.x + (targetX - start.x) * fraction;
+    const nextY = start.y + (targetY - start.y) * fraction;
+    const data = parseRconJson<any>(
+      await rconCommand(
+        agentMoveStepCommand({
+          x: nextX,
+          y: nextY,
+          direction: directionForVector(nextX - movedX, nextY - movedY),
+        }),
+      ),
+      "RCON move step returned invalid JSON",
+    );
+    if (!data?.ok) {
+      return {
+        ok: false,
+        error: data?.error || "blocked",
+        movement: { distance, duration_ms: Math.round(walkDelayMs(distance) * (step - 1) / steps), final_position: { x: movedX, y: movedY } },
+      };
+    }
+    movedX = data.x;
+    movedY = data.y;
+  }
+  return {
+    ok: true,
+    movement: { distance, duration_ms: walkDelayMs(distance), final_position: { x: movedX, y: movedY } },
+  };
+}
+
 function agentRotateCommand(targets: Array<{ x: number; y: number }>): string {
   const parts = [
     "/sc",
@@ -1059,16 +1239,11 @@ function agentRotateCommand(targets: Array<{ x: number; y: number }>): string {
     "local function ensure_reach(entity)",
     "if not player or not player.character then return false,'no_character' end",
     "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
-    "local target_pos=entity.position",
-    "local safe_pos=s.find_non_colliding_position('character', target_pos, 6, 0.5)",
-    "if safe_pos then player.teleport(safe_pos) end",
-    "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
     "return false,'out_of_reach'",
     "end",
     "local results={}",
     "local function rotate(x,y)",
-    "local ents=s.find_entities_filtered{position={x,y}} or {}",
-    "local e=ents[1]",
+    "local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.type~='character' and cand.type~='resource' and cand.type~='item-entity' and cand.type~='corpse' then table.insert(candidates,{entity=cand,key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) return a.key<b.key end) local e=candidates[1] and candidates[1].entity or nil",
     "if not e then return {x=x,y=y,ok=false,error='no_entity'} end",
     "local can_reach,reach_err=ensure_reach(e)",
     "if not can_reach then return {x=x,y=y,name=e.name,ok=false,error=reach_err or 'out_of_reach'} end",
@@ -1118,16 +1293,11 @@ function agentSetRecipeCommand(
     "local function ensure_reach(entity)",
     "if not player or not player.character then return false,'no_character' end",
     "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
-    "local target_pos=entity.position",
-    "local safe_pos=s.find_non_colliding_position('character', target_pos, 6, 0.5)",
-    "if safe_pos then player.teleport(safe_pos) end",
-    "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
     "return false,'out_of_reach'",
     "end",
     "local results={}",
     "local function set_recipe(x,y,recipe)",
-    "local ents=s.find_entities_filtered{position={x,y}} or {}",
-    "local e=ents[1]",
+    "local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.type~='character' and cand.type~='resource' and cand.type~='item-entity' and cand.type~='corpse' then table.insert(candidates,{entity=cand,key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) return a.key<b.key end) local e=candidates[1] and candidates[1].entity or nil",
     "if not e then return {x=x,y=y,ok=false,error='no_entity'} end",
     "local can_reach,reach_err=ensure_reach(e)",
     "if not can_reach then return {x=x,y=y,name=e.name,ok=false,error=reach_err or 'out_of_reach'} end",
@@ -1235,6 +1405,7 @@ function agentCraftCommand(recipe: string, count: number): string {
     "end",
     `local recipe=${luaString(recipe)}`,
     `local count=${count}`,
+    "if not player.force.recipes[recipe] then rcon.print('{\"recipe\":'..esc(recipe)..',\"count\":'..esc(count)..',\"ok\":false,\"error\":\"Unknown recipe\"}') return end",
     "local craftable=player.get_craftable_count(recipe)",
     "if craftable < count then",
     "local out={}",
@@ -1286,24 +1457,24 @@ function agentInsertCommand(params: {
     "local function ensure_reach(entity)",
     "if not player or not player.character then return false,'no_character' end",
     "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
-    "local target_pos=entity.position",
-    "local safe_pos=s.find_non_colliding_position('character', target_pos, 6, 0.5)",
-    "if safe_pos then player.teleport(safe_pos) end",
-    "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
     "return false,'out_of_reach'",
     "end",
-    "local ents=s.find_entities_filtered{position={x,y}} or {}",
-    "local e=ents[1]",
+    "local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.type~='resource' and cand.type~='character' and cand.type~='item-entity' and cand.type~='corpse' then local dx=cand.position.x-(x+0.5) local dy=cand.position.y-(y+0.5) table.insert(candidates,{entity=cand,score=-(dx*dx+dy*dy),key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end)",
+    "local e=candidates[1] and candidates[1].entity or nil",
     'if not e then rcon.print(\'{"ok":false,"error":"no_entity"}\') return end',
     "local can_reach,reach_err=ensure_reach(e)",
     "if not can_reach then rcon.print('{\"ok\":false,\"error\":'..esc(reach_err or 'out_of_reach')..'}') return end",
+    "local available=player.get_item_count(item) or 0",
+    "if available < count then rcon.print(helpers.table_to_json{ok=false,error='count too high: requested '..count..' but only '..available..' available',available=available,requested=count,entity=e.name}) return end",
     "local removed=player.remove_item{name=item,count=count}",
     "local inserted=e.insert{name=item,count=removed}",
     "if inserted < removed then player.insert{name=item,count=removed-inserted} end",
     "local out={}",
-    "table.insert(out,'\"ok\":true')",
+    "table.insert(out,'\"ok\":'..tostring(inserted==count))",
+    "table.insert(out,'\"entity\":'..esc(e.name))",
     "table.insert(out,'\"removed\":'..esc(removed))",
     "table.insert(out,'\"inserted\":'..esc(inserted))",
+    "if inserted<count then table.insert(out,'\"error\":'..esc('entity capacity too low: requested '..count..' but inserted '..inserted)) end",
     "rcon.print('{'..table.concat(out,',')..'}')",
   ];
   return parts.join(" ");
@@ -1339,14 +1510,10 @@ function agentExtractCommand(params: {
     "local function ensure_reach(entity)",
     "if not player or not player.character then return false,'no_character' end",
     "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
-    "local target_pos=entity.position",
-    "local safe_pos=s.find_non_colliding_position('character', target_pos, 6, 0.5)",
-    "if safe_pos then player.teleport(safe_pos) end",
-    "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
     "return false,'out_of_reach'",
     "end",
-    "local ents=s.find_entities_filtered{position={x,y}} or {}",
-    "local e=ents[1]",
+    "local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.type~='resource' and cand.type~='character' and cand.type~='item-entity' and cand.type~='corpse' then local dx=cand.position.x-(x+0.5) local dy=cand.position.y-(y+0.5) table.insert(candidates,{entity=cand,score=-(dx*dx+dy*dy),key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end)",
+    "local e=candidates[1] and candidates[1].entity or nil",
     'if not e then rcon.print(\'{"ok":false,"error":"no_entity"}\') return end',
     "local can_reach,reach_err=ensure_reach(e)",
     "if not can_reach then rcon.print('{\"ok\":false,\"error\":'..esc(reach_err or 'out_of_reach')..'}') return end",
@@ -1362,137 +1529,46 @@ function agentExtractCommand(params: {
     "return",
     "end",
     "if count == 0 then",
-    "rcon.print('{\"ok\":true,\"removed\":0,\"inserted\":0}')",
+    "rcon.print(helpers.table_to_json{ok=true,entity=e.name,removed=0,inserted=0})",
     "return",
     "end",
     "local removed=e.remove_item{name=item,count=count}",
     "local inserted=player.insert{name=item,count=removed}",
+    "if inserted < removed then e.insert{name=item,count=removed-inserted} end",
     "local out={}",
-    "table.insert(out,'\"ok\":true')",
+    "table.insert(out,'\"ok\":'..tostring(inserted==count))",
+    "table.insert(out,'\"entity\":'..esc(e.name))",
     "table.insert(out,'\"removed\":'..esc(removed))",
     "table.insert(out,'\"inserted\":'..esc(inserted))",
+    "if inserted<count then table.insert(out,'\"error\":'..esc('player inventory capacity too low: requested '..count..' but inserted '..inserted)) end",
     "rcon.print('{'..table.concat(out,',')..'}')",
   ];
   return parts.join(" ");
 }
 
 function agentObserveEntityCommand(
-  targets: Array<{ x: number; y: number }>,
+  targets: Array<{ x: number; y: number; kind?: string; name?: string }>,
 ): string {
   const parts = [
-    "/sc",
-    "local s=game.surfaces[1]",
-    "local function esc(v)",
-    "if v==nil then return 'null' end",
-    "local t=type(v)",
-    'if t==\"string\" then',
-    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    'elseif t==\"number\" or t==\"boolean\" then',
-    "return tostring(v)",
-    "else",
-    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    "end",
-    "end",
-    "local results={}",
-    "local function find_entity(x,y)",
-    "local ents=s.find_entities_filtered{position={x,y}} or {}",
-    "if #ents > 0 then return ents[1] end",
-    "local area={{x-0.5,y-0.5},{x+0.5,y+0.5}}",
-    "ents=s.find_entities_filtered{area=area} or {}",
-    "for i=1,#ents do",
-    "local cand=ents[i]",
-    "if cand and cand.valid then return cand end",
-    "end",
-    "return nil",
-    "end",
-    "local function observe(x,y)",
-    "local e=find_entity(x,y)",
-    "if not e then return '{\"x\":'..x..',\"y\":'..y..',\"ok\":false,\"error\":\"no_entity\"}' end",
-    "local f={}",
-    "table.insert(f,'\"ok\":true')",
-    "table.insert(f,'\"name\":'..esc(e.name))",
-    "table.insert(f,'\"type\":'..esc(e.type))",
-    "table.insert(f,'\"x\":'..esc(math.floor(e.position.x)))",
-    "table.insert(f,'\"y\":'..esc(math.floor(e.position.y)))",
-    "table.insert(f,'\"center_x\":'..esc(e.position.x))",
-    "table.insert(f,'\"center_y\":'..esc(e.position.y))",
-    "table.insert(f,'\"direction\":'..esc(e.direction))",
-    "local ok_s,status=pcall(function() return e.status end)",
-    "if ok_s and status then",
-    "local status_names={}",
-    "for k,v in pairs(defines.entity_status) do status_names[v]=k end",
-    "table.insert(f,'\"status\":'..esc(status_names[status] or tostring(status)))",
-    "else",
-    "table.insert(f,'\"status\":null')",
-    "end",
-    "local ok_h,health=pcall(function() return e.health end)",
-    "table.insert(f,'\"health\":'..esc(ok_h and health or nil))",
-    "local ok_mh,max_health=pcall(function() return e.prototype.max_health end)",
-    "table.insert(f,'\"max_health\":'..esc(ok_mh and max_health or nil))",
-    "local ok_e,energy=pcall(function() return e.energy end)",
-    "table.insert(f,'\"energy\":'..esc(ok_e and energy or nil))",
-    "local fuel_out={}",
-    "local ok_fi,fi=pcall(function() return e.get_fuel_inventory() end)",
-    "if ok_fi and fi and fi.valid then",
-    "for i=1,#fi do",
-    "local stack=fi[i]",
-    "if stack and stack.valid_for_read then",
-    "table.insert(fuel_out,'{\"name\":'..esc(stack.name)..',\"count\":'..stack.count..'}')",
-    "end",
-    "end",
-    "end",
-    "table.insert(f,'\"fuel_inventory\":['..table.concat(fuel_out,',')..']')",
-    "local fb_out={}",
-    "local ok_fb,fb_count=pcall(function() return #e.fluidbox end)",
-    "if ok_fb and fb_count and fb_count > 0 then",
-    "for i=1,fb_count do",
-    "local fb_entry={}",
-    "table.insert(fb_entry,'\"index\":'..i)",
-    "local ok_fluid,fluid=pcall(function() return e.fluidbox[i] end)",
-    "if ok_fluid and fluid then",
-    "table.insert(fb_entry,'\"fluid\":'..esc(fluid.name))",
-    "table.insert(fb_entry,'\"amount\":'..esc(fluid.amount))",
-    "else",
-    "table.insert(fb_entry,'\"fluid\":null')",
-    "table.insert(fb_entry,'\"amount\":0')",
-    "end",
-    "local ok_conn,conns=pcall(function() return e.fluidbox.get_connections(i) end)",
-    "local conn_out={}",
-    "if ok_conn and conns then",
-    "for _,c in pairs(conns) do",
-    "local owner=c.owner",
-    "if owner then",
-    "table.insert(conn_out,'{\"name\":'..esc(owner.name)..',\"x\":'..esc(math.floor(owner.position.x))..',\"y\":'..esc(math.floor(owner.position.y))..'}')",
-    "end",
-    "end",
-    "end",
-    "table.insert(fb_entry,'\"connected_to\":['..table.concat(conn_out,',')..']')",
-    "table.insert(fb_out,'{'..table.concat(fb_entry,',')..'}')",
-    "end",
-    "end",
-    "table.insert(f,'\"fluid_boxes\":['..table.concat(fb_out,',')..']')",
-    "local ok_r,recipe=pcall(function() local r=e.get_recipe() return r and r.name or nil end)",
-    "table.insert(f,'\"recipe\":'..esc(ok_r and recipe or nil))",
-    "local output_out={}",
-    "local ok_oi,oi=pcall(function() return e.get_output_inventory() end)",
-    "if ok_oi and oi and oi.valid then",
-    "for i=1,#oi do",
-    "local stack=oi[i]",
-    "if stack and stack.valid_for_read then",
-    "table.insert(output_out,'{\"name\":'..esc(stack.name)..',\"count\":'..stack.count..'}')",
-    "end",
-    "end",
-    "end",
-    "table.insert(f,'\"output_inventory\":['..table.concat(output_out,',')..']')",
-    "return '{'..table.concat(f,',')..'}'",
-    "end",
+    "/sc", "local s=game.surfaces[1]", "local force=game.forces.player or game.forces[1]", "local results={}",
+    "local function find_entity(x,y,kind,wanted_name) local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.type~='character' and cand.type~='item-entity' and cand.type~='corpse' and (not kind or (kind=='resource' and cand.type=='resource') or (kind=='entity' and cand.type~='resource')) and (not wanted_name or cand.name==wanted_name) then local dx=cand.position.x-(x+0.5) local dy=cand.position.y-(y+0.5) local score=(cand.type=='resource' and 0 or 100)+(wanted_name and 1000 or 0)-dx*dx-dy*dy table.insert(candidates,{entity=cand,score=score,key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end) return candidates[1] and candidates[1].entity or nil end",
+    "local function items(inv) local out={} if inv and inv.valid then for i=1,#inv do local stack=inv[i] if stack and stack.valid_for_read then table.insert(out,{slot=i,name=stack.name,count=stack.count}) end end end return out end",
+    "local function observe(x,y,kind,wanted_name)",
+    "if not force.is_chunk_charted(s,{x=math.floor(x/32),y=math.floor(y/32)}) then return {requested_tile={x=x,y=y},ok=false,error='uncharted'} end",
+    "local e=find_entity(x,y,kind,wanted_name) if not e then return {requested_tile={x=x,y=y},ok=false,error=kind=='resource' and 'no_resource' or 'no_entity'} end",
+    "local status=nil local ok_status,value=pcall(function() return e.status end) if ok_status and value then local names={} for k,v in pairs(defines.entity_status) do names[v]=k end status=names[value] or tostring(value) end",
+    "local health=nil pcall(function() health=e.health end) local max_health=nil pcall(function() max_health=e.prototype.max_health end) local energy=nil pcall(function() energy=e.energy end)",
+    "local inventories={} local seen={} local function add_inventory(purpose,inv,index) if not inv or not inv.valid then return end local resolved_index=index pcall(function() resolved_index=resolved_index or inv.index end) local existing=resolved_index and seen[resolved_index] or nil if existing then local already=false for _,known in pairs(existing.purposes) do if known==purpose then already=true break end end if not already then table.insert(existing.purposes,purpose) end return end local factorio_name=nil pcall(function() factorio_name=inv.name end) local entry={purposes={purpose},factorio_name=factorio_name,index=resolved_index,items=items(inv)} if resolved_index then seen[resolved_index]=entry end table.insert(inventories,entry) end",
+    "local ok,inv=pcall(function() return e.get_fuel_inventory() end) if ok then add_inventory('fuel',inv) end ok,inv=pcall(function() return e.get_burnt_result_inventory() end) if ok then add_inventory('burnt_result',inv) end if e.type=='furnace' or e.type=='assembling-machine' or e.type=='rocket-silo' then ok,inv=pcall(function() return e.get_output_inventory() end) if ok then add_inventory('output',inv) end end ok,inv=pcall(function() return e.get_module_inventory() end) if ok then add_inventory('modules',inv) end",
+    "local max_index=0 pcall(function() local value=e.get_max_inventory_index() if type(value)=='number' then max_index=value end end) for index=1,max_index do local got=nil pcall(function() got=e.get_inventory(index) end) if got and got.valid then local n=nil pcall(function() n=e.get_inventory_name(index) end) add_inventory(n or 'inventory',got,index) end end",
+    "local fluid_boxes={} local fb_count=0 pcall(function() fb_count=#e.fluidbox end) for index=1,fb_count do local fluid=nil pcall(function() fluid=e.fluidbox[index] end) local capacity=nil pcall(function() capacity=e.fluidbox.get_capacity(index) end) local filter=nil pcall(function() local f=e.fluidbox.get_filter(index) filter=f and f.name or nil end) local production_type=nil pcall(function() local fp=e.fluidbox.get_prototype(index) if fp and fp.production_type then production_type=fp.production_type end end) local connections={} pcall(function() for _,c in pairs(e.fluidbox.get_pipe_connections(index) or {}) do local owner=c.target and c.target.owner or nil table.insert(connections,{connection_type=c.connection_type,flow_direction=c.flow_direction,position={x=c.position.x,y=c.position.y},target_position={x=c.target_position.x,y=c.target_position.y},target=owner and {name=owner.name,center={x=owner.position.x,y=owner.position.y}} or nil,target_fluidbox_index=c.target_fluidbox_index,target_pipe_connection_index=c.target_pipe_connection_index}) end end) table.insert(fluid_boxes,{index=index,production_type=production_type,filter=filter,capacity=capacity,fluid=fluid and {name=fluid.name,amount=fluid.amount,temperature=fluid.temperature} or nil,connections=connections}) end",
+    "local recipe=nil pcall(function() local r=e.get_recipe() recipe=r and r.name or nil end) local drop_position=nil pcall(function() drop_position=e.drop_position end) local drop_target=nil pcall(function() local t=e.drop_target drop_target=t and {name=t.name,center={x=t.position.x,y=t.position.y}} or nil end)",
+    "return {requested_tile={x=x,y=y},ok=true,name=e.name,type=e.type,center={x=e.position.x,y=e.position.y},occupied_tile={x=math.floor(e.position.x),y=math.floor(e.position.y)},direction=e.direction,status=status,health=health,max_health=max_health,energy=energy,recipe=recipe,inventories=inventories,fluid_boxes=fluid_boxes,drop_position=drop_position and {x=drop_position.x,y=drop_position.y} or nil,drop_target=drop_target} end",
   ];
   for (const target of targets) {
-    parts.push(`table.insert(results,observe(${target.x},${target.y}))`);
+    parts.push(`table.insert(results,observe(${target.x},${target.y},${target.kind ? luaString(target.kind) : "nil"},${target.name ? luaString(target.name) : "nil"}))`);
   }
-  parts.push(
-    "rcon.print('{\"results\":['..table.concat(results,',')..']}')",
-  );
+  parts.push("rcon.print(helpers.table_to_json{results=results})");
   return parts.join(" ");
 }
 
@@ -1551,67 +1627,20 @@ function agentResourcesCommand(params: {
 }
 
 function agentEntityPrototypeCommand(name: string): string {
-  const parts = [
-    "/sc",
-    "local function esc(v)",
-    "if v==nil then return 'null' end",
-    "local t=type(v)",
-    'if t==\"string\" then',
-    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    'elseif t==\"number\" or t==\"boolean\" then',
-    "return tostring(v)",
-    "else",
-    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    "end",
-    "end",
-    `local name=${luaString(name)}`,
-    "local proto=game.entity_prototypes[name]",
-    "if not proto then rcon.print('{\"ok\":false,\"error\":'..esc('Unknown entity: '..name)..'}') return end",
-    "local w=0 local h=0",
-    "if proto.collision_box then",
-    "local cb=proto.collision_box",
-    "w=math.ceil(cb.right_bottom.x - cb.left_top.x)",
-    "h=math.ceil(cb.right_bottom.y - cb.left_top.y)",
-    "end",
-    "local fb_out={}",
-    "if proto.fluidbox_prototypes then",
-    "for i,fb in pairs(proto.fluidbox_prototypes) do",
-    "local conns={}",
-    "if fb.pipe_connections then",
-    "for _,pc in pairs(fb.pipe_connections) do",
-    "local pos_out={}",
-    "if pc.positions then",
-    "for pi,pos in pairs(pc.positions) do",
-    "table.insert(pos_out,'{\"x\":'..esc(pos.x)..',\"y\":'..esc(pos.y)..'}')",
-    "end",
-    "end",
-    "table.insert(conns,'{\"type\":'..esc(pc.type)..',\"positions\":['..table.concat(pos_out,',')..']}')",
-    "end",
-    "end",
-    "table.insert(fb_out,'{\"production_type\":'..esc(fb.production_type)..',\"pipe_connections\":['..table.concat(conns,',')..']}')",
-    "end",
-    "end",
-    "local energy_type='none'",
-    "if proto.electric_energy_source_prototype then energy_type='electric'",
-    "elseif proto.burner_prototype then energy_type='burner'",
-    "end",
-    "local fuel_cats={}",
-    "if proto.burner_prototype and proto.burner_prototype.fuel_categories then",
-    "for cat,_ in pairs(proto.burner_prototype.fuel_categories) do",
-    "table.insert(fuel_cats,esc(cat))",
-    "end",
-    "end",
-    "local out={}",
-    "table.insert(out,'\"name\":'..esc(name))",
-    "table.insert(out,'\"width\":'..w)",
-    "table.insert(out,'\"height\":'..h)",
-    "table.insert(out,'\"fluid_boxes\":['..table.concat(fb_out,',')..']')",
-    "table.insert(out,'\"energy_type\":'..esc(energy_type))",
-    "table.insert(out,'\"fuel_categories\":['..table.concat(fuel_cats,',')..']')",
-    "table.insert(out,'\"max_health\":'..esc(proto.max_health))",
-    "rcon.print('{'..table.concat(out,',')..'}')",
-  ];
-  return parts.join(" ");
+  return [
+    "/sc", `local name=${luaString(name)}`, "local proto=prototypes.entity[name]",
+    "if not proto then rcon.print(helpers.table_to_json{ok=false,error='unknown_entity',name=name}) return end",
+    "local function box(value) if not value then return nil end return {left_top={x=value.left_top.x,y=value.left_top.y},right_bottom={x=value.right_bottom.x,y=value.right_bottom.y}} end",
+    "local fluid_boxes={} local direction_names={[0]='north',[4]='east',[8]='south',[12]='west'} local direction_vectors={[0]={x=0,y=-1},[4]={x=1,y=0},[8]={x=0,y=1},[12]={x=-1,y=0}} for index,fb in pairs(proto.fluidbox_prototypes or {}) do local connections={} for _,pc in pairs(fb.pipe_connections or {}) do local positions={} for orientation,pos in pairs(pc.positions or {}) do local actual_direction=((pc.direction or 0)+(orientation-1)*4)%16 local vector=direction_vectors[actual_direction] table.insert(positions,{orientation_index=orientation,orientation_name=({'north','east','south','west'})[orientation],connection_position={x=pos.x,y=pos.y},connection_direction=direction_names[actual_direction],compatible_neighbor_position=vector and {x=pos.x+vector.x,y=pos.y+vector.y} or nil}) end table.insert(connections,{connection_type=pc.connection_type,flow_direction=pc.flow_direction,connection_category=pc.connection_category,positions=positions,max_underground_distance=pc.max_underground_distance}) end table.insert(fluid_boxes,{index=index,production_type=fb.production_type,filter=fb.filter and fb.filter.name or nil,minimum_temperature=fb.minimum_temperature,maximum_temperature=fb.maximum_temperature,pipe_connections=connections}) end",
+    "table.sort(fluid_boxes,function(a,b) return a.index<b.index end)",
+    "local function safe(read) local ok,value=pcall(read) if ok then return value end return nil end local electric=safe(function() return proto.electric_energy_source_prototype end) local burner=safe(function() return proto.burner_prototype end) local fluid=safe(function() return proto.fluid_energy_source_prototype end) local heat=safe(function() return proto.heat_energy_source_prototype end)",
+    "local energy_type='none' if electric then energy_type='electric' elseif burner then energy_type='burner' elseif fluid then energy_type='fluid' elseif heat then energy_type='heat' end",
+    "local fuel_categories={} if burner then for category,_ in pairs(burner.fuel_categories or {}) do table.insert(fuel_categories,category) end table.sort(fuel_categories) end",
+    "local placeable_by={} for _,item in pairs(proto.items_to_place_this or {}) do table.insert(placeable_by,{name=item.name,count=item.count}) end",
+    "local max_health=safe(function() return proto.max_health end) local flags=safe(function() return proto.flags end) or {}",
+    "local out={ok=true,name=name,type=proto.type,tile_size={width=proto.tile_width,height=proto.tile_height},center_alignment={x=(proto.tile_width%2==0) and 'integer' or 'half_tile',y=(proto.tile_height%2==0) and 'integer' or 'half_tile'},collision_box=box(proto.collision_box),selection_box=box(proto.selection_box),rotatable=not flags['not-rotatable'],placeable_by=placeable_by,fluid_boxes=fluid_boxes,energy_source=energy_type,fuel_categories=fuel_categories,max_health=max_health}",
+    "rcon.print(helpers.table_to_json(out))",
+  ].join(" ");
 }
 
 function statusPayload() {
@@ -1876,11 +1905,155 @@ async function ensureRconConnection() {
   await connectRcon();
 }
 
-async function rconCommand(command: string): Promise<string> {
+async function rconCommand(command: string, timeoutMs = 3000): Promise<string> {
   if (!state.rcon.connected) throw new Error("RCON not connected");
   const id = state.rcon.nextId++;
-  return rconSendInternal(id, 2, command, 3000);
+  return rconSendInternal(id, 2, command, timeoutMs);
 }
+
+type JobAction =
+  | "build"
+  | "mine"
+  | "move"
+  | "rotate"
+  | "set-recipe"
+  | "research"
+  | "craft"
+  | "insert"
+  | "extract";
+
+type ActionJob = {
+  id: string;
+  action: JobAction;
+  idempotency_key: string | null;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  total: number;
+  completed: number;
+  results: any[];
+  error: string | null;
+  cancel_requested: boolean;
+  payload: any;
+};
+
+const jobs = new Map<string, ActionJob>();
+const jobKeys = new Map<string, string>();
+let actionQueue: Promise<void> = Promise.resolve();
+
+const actionPaths: Record<JobAction, string> = {
+  build: "/api/agent/act/build",
+  mine: "/api/agent/act/mine",
+  move: "/api/agent/act/move",
+  rotate: "/api/agent/act/rotate",
+  "set-recipe": "/api/agent/act/set-recipe",
+  research: "/api/agent/act/research",
+  craft: "/api/agent/act/craft",
+  insert: "/api/agent/act/insert",
+  extract: "/api/agent/act/extract",
+};
+
+function splitJobPayload(action: JobAction, payload: any): any[] {
+  if (action === "build") return (Array.isArray(payload?.entities) ? payload.entities : []).map((entity: any) => ({ entities: [entity] }));
+  if (["mine", "move", "rotate", "set-recipe"].includes(action)) {
+    return (Array.isArray(payload?.targets) ? payload.targets : []).map((target: any) => ({ targets: [target] }));
+  }
+  return [payload ?? {}];
+}
+
+function publicJob(job: ActionJob) {
+  return {
+    job_id: job.id,
+    action: job.action,
+    idempotency_key: job.idempotency_key,
+    status: job.status,
+    created_at: job.created_at,
+    started_at: job.started_at,
+    completed_at: job.completed_at,
+    progress: { completed: job.completed, total: job.total },
+    results: job.results,
+    error: job.error,
+    cancel_requested: job.cancel_requested,
+  };
+}
+
+async function runActionJob(job: ActionJob) {
+  if (job.cancel_requested) {
+    job.status = "cancelled";
+    job.completed_at = new Date().toISOString();
+    return;
+  }
+  job.status = "running";
+  job.started_at = new Date().toISOString();
+  const items = splitJobPayload(job.action, job.payload);
+  try {
+    for (const payload of items) {
+      if (job.cancel_requested) {
+        job.status = "cancelled";
+        break;
+      }
+      const response = await fetch(`http://127.0.0.1:${PORT}${actionPaths[job.action]}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Autorio-Internal": "job" },
+        body: JSON.stringify(payload),
+      });
+      const envelope = await response.json() as any;
+      const data = envelope?.data;
+      let result = data?.results?.[0] ?? data ?? envelope;
+      if (!response.ok) {
+        result = { ok: false, error: envelope?.error || `HTTP ${response.status}`, detail: result };
+      }
+      job.results.push(result);
+      job.completed++;
+    }
+    if (job.status !== "cancelled") job.status = "completed";
+  } catch (err: any) {
+    job.status = "failed";
+    job.error = err?.message || "Action job failed";
+  } finally {
+    job.completed_at = new Date().toISOString();
+  }
+}
+
+function queueActionJob(action: JobAction, payload: any, idempotencyKey: string | null) {
+  const scopedKey = idempotencyKey ? `${action}:${idempotencyKey}` : null;
+  if (idempotencyKey) {
+    const existingId = jobKeys.get(scopedKey!);
+    const existing = existingId ? jobs.get(existingId) : null;
+    if (existing) return existing;
+  }
+  const items = splitJobPayload(action, payload);
+  const job: ActionJob = {
+    id: randomUUID(),
+    action,
+    idempotency_key: idempotencyKey,
+    status: "queued",
+    created_at: new Date().toISOString(),
+    started_at: null,
+    completed_at: null,
+    total: items.length,
+    completed: 0,
+    results: [],
+    error: null,
+    cancel_requested: false,
+    payload,
+  };
+  jobs.set(job.id, job);
+  if (scopedKey) jobKeys.set(scopedKey, job.id);
+  actionQueue = actionQueue.then(() => runActionJob(job), () => runActionJob(job));
+  return job;
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - JOB_RETENTION_MS;
+  for (const [id, job] of jobs) {
+    if (job.completed_at && Date.parse(job.completed_at) < cutoff) {
+      jobs.delete(id);
+      if (job.idempotency_key) jobKeys.delete(`${job.action}:${job.idempotency_key}`);
+    }
+  }
+}, 60_000);
 
 setInterval(() => {
   sampleUsage().catch(() => {});
@@ -1896,12 +2069,90 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     `http://${req.headers.host || "localhost"}`,
   );
 
+  if (req.method === "POST" && url.pathname === "/api/agent/jobs") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) return json(res, 409, { error: "RCON not configured" });
+    if (!state.rcon.connected) return json(res, 409, { error: "RCON not connected" });
+    const action = body?.action as JobAction;
+    if (!action || !(action in actionPaths)) {
+      return json(res, 400, { error: "Unknown job action", allowed_actions: Object.keys(actionPaths) });
+    }
+    if (splitJobPayload(action, body?.payload).length === 0) {
+      return json(res, 400, { error: "Action payload contains no work" });
+    }
+    const keyHeader = req.headers["idempotency-key"];
+    const idempotencyKey =
+      (typeof keyHeader === "string" ? keyHeader : null) ??
+      (typeof body?.idempotency_key === "string" ? body.idempotency_key : null);
+    const job = queueActionJob(action, body?.payload, idempotencyKey);
+    return json(res, 202, publicJob(job));
+  }
+
+  const jobMatch = url.pathname.match(/^\/api\/agent\/jobs\/([^/]+)$/);
+  if (jobMatch && req.method === "GET") {
+    const job = jobs.get(jobMatch[1]);
+    if (!job) return json(res, 404, { error: "Job not found" });
+    return json(res, 200, publicJob(job));
+  }
+  const cancelJobMatch = url.pathname.match(/^\/api\/agent\/jobs\/([^/]+)\/cancel$/);
+  if (cancelJobMatch && req.method === "POST") {
+    const job = jobs.get(cancelJobMatch[1]);
+    if (!job) return json(res, 404, { error: "Job not found" });
+    if (job.status === "queued" || job.status === "running") job.cancel_requested = true;
+    return json(res, 202, publicJob(job));
+  }
+
+  if (
+    url.pathname.startsWith("/api/agent/act/") &&
+    req.headers["x-autorio-internal"] !== "job"
+  ) {
+    return json(res, 409, {
+      error: "Actions must be submitted through POST /api/agent/jobs",
+    });
+  }
+
   if (req.method === "GET" && url.pathname === "/api/saves") {
     try {
       const saves = await listSaves();
       return json(res, 200, { saves });
     } catch (err: any) {
       return json(res, 500, { error: err?.message || "Failed to list saves" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/saves") {
+    if (saveCreationInProgress) {
+      return json(res, 409, { error: "A save is already being created" });
+    }
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+
+    let save: string;
+    try {
+      save = normalizeSaveFilename(body?.name);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid save name" });
+    }
+
+    saveCreationInProgress = true;
+    try {
+      await createSave(save);
+      return json(res, 201, { ok: true, save });
+    } catch (err: any) {
+      const message = err?.message || "Failed to create save";
+      const status = message === "Save already exists" ? 409 : 500;
+      return json(res, status, { error: message });
+    } finally {
+      saveCreationInProgress = false;
     }
   }
 
@@ -1914,48 +2165,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     const limit = Math.max(1, Math.min(1000, Number(limitRaw) || 200));
     const lines = state.logs.slice(-limit);
     return json(res, 200, { lines });
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/rcon/world") {
-    if (!rconConfigured()) {
-      return json(res, 409, { error: "RCON not configured" });
-    }
-    if (!state.rcon.connected) {
-      return json(res, 409, { error: "RCON not connected" });
-    }
-    try {
-      const response = await rconCommand(worldInfoCommand());
-      let data: unknown = response;
-      try {
-        data = JSON.parse(response);
-      } catch {
-        // Leave as raw string if it isn't JSON.
-      }
-      return json(res, 200, { ok: true, response, data });
-    } catch (err: any) {
-      return json(res, 500, { error: err?.message || "RCON command failed" });
-    }
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/rcon/test-items") {
-    if (!rconConfigured()) {
-      return json(res, 409, { error: "RCON not configured" });
-    }
-    if (!state.rcon.connected) {
-      return json(res, 409, { error: "RCON not connected" });
-    }
-    try {
-      const response = await rconCommand(placeTestItemsCommand());
-      let data: unknown = response;
-      try {
-        data = JSON.parse(response);
-      } catch {
-        // Leave as raw string if it isn't JSON.
-      }
-      return json(res, 200, { ok: true, response, data });
-    } catch (err: any) {
-      return json(res, 500, { error: err?.message || "RCON command failed" });
-    }
   }
 
   if (req.method === "POST" && url.pathname === "/api/agent/observe/world") {
@@ -1975,14 +2184,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     const include: string[] = Array.isArray(body?.include)
       ? body.include
       : ["tiles", "entities"];
-    const includeTiles = include.includes("tiles");
+    const includeTiles = include.includes("terrain");
     const includeEntities = include.includes("entities");
     const radius = clampInt(window.radius, AGENT_DEFAULT_RADIUS, 1, 200);
     const x = clampInt(window.x, 0, -1000000, 1000000);
     const y = clampInt(window.y, 0, -1000000, 1000000);
     try {
       const response = await rconCommand(
-        agentWorldCommand({
+        agentCompactWorldCommand({
           x,
           y,
           radius,
@@ -1996,6 +2205,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       } catch {
         // Leave as raw string if it isn't JSON.
       }
+      data = normalizeWorldData(data);
       const counts = data?.counts || {};
       const truncated =
         (includeTiles && counts.tiles_included < counts.tiles_total) ||
@@ -2004,6 +2214,30 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
         ok: true,
         data,
         truncated,
+      });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/observe/map") {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) return json(res, 409, { error: "RCON not configured" });
+    if (!state.rcon.connected) return json(res, 409, { error: "RCON not connected" });
+    const window = body?.window || {};
+    const x = clampInt(window.x, 0, -1000000, 1000000);
+    const y = clampInt(window.y, 0, -1000000, 1000000);
+    const radius = clampInt(window.radius, 48, 1, 96);
+    try {
+      const response = await rconCommand(agentMapCommand({ x, y, radius }));
+      return json(res, 200, {
+        ok: true,
+        data: parseRconJson(response, "RCON map returned invalid JSON"),
       });
     } catch (err: any) {
       return json(res, 500, { error: err?.message || "RCON command failed" });
@@ -2070,22 +2304,26 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       return json(res, 409, { error: "RCON not connected" });
     }
     const limits = body?.limits || {};
-    const limit = clampInt(
-      limits.available,
-      AGENT_MAX_RESEARCH,
-      1,
-      AGENT_MAX_RESEARCH,
-    );
+    const availableLimit = clampInt(limits.available, 50, 0, AGENT_MAX_RESEARCH);
+    const lockedLimit = clampInt(limits.locked, 50, 0, AGENT_MAX_RESEARCH);
+    const completedLimit = clampInt(limits.completed, 50, 0, AGENT_MAX_RESEARCH);
     try {
-      const response = await rconCommand(agentResearchCommand({ limit }));
+      const response = await rconCommand(
+        agentResearchCommand({ availableLimit, lockedLimit, completedLimit }),
+      );
       let data: any = response;
       try {
         data = JSON.parse(response);
       } catch {
         // Leave as raw string if it isn't JSON.
       }
+      data = normalizeResearchData(data);
       const counts = data?.counts || {};
-      const truncated = counts.available_included < counts.available_total;
+      const truncated = {
+        available: counts.available_included < counts.available_total,
+        locked: counts.locked_included < counts.locked_total,
+        completed: counts.completed_included < counts.completed_total,
+      };
       return json(res, 200, { ok: true, data, truncated });
     } catch (err: any) {
       return json(res, 500, { error: err?.message || "RCON command failed" });
@@ -2150,64 +2388,45 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     const max = clampInt(limits.max, AGENT_MAX_ACTIONS, 1, AGENT_MAX_ACTIONS);
     const trimmed = entities
       .slice(0, max)
-      .filter((e) => e?.name && e?.x !== undefined && e?.y !== undefined);
+      .filter(
+        (e) =>
+          e?.name &&
+          Number.isFinite(Number(e?.anchor?.x)) &&
+          Number.isFinite(Number(e?.anchor?.y)),
+      ) as BuildRequest[];
     try {
       const results: any[] = [];
       for (const entity of trimmed) {
-        const probeResponse = await rconCommand(agentPlayerPositionCommand());
-        const probe = parseRconJson<any>(
-          probeResponse,
-          "RCON probe returned invalid JSON",
+        const destination = parseRconJson<any>(
+          await rconCommand(agentBuildDestinationCommand(entity)),
+          "RCON build destination returned invalid JSON",
         );
-        if (probe?.error) {
+        if (!destination?.ok) {
           results.push({
-            name: entity?.name,
-            x: Number(entity.x),
-            y: Number(entity.y),
             ok: false,
-            error: probe.error,
+            name: entity.name,
+            requested_anchor: entity.anchor,
+            error: destination?.error || "no_reachable_staging_position",
           });
           continue;
         }
-        const playerPos = probe?.player;
-        if (
-          !playerPos ||
-          !Number.isFinite(playerPos.x) ||
-          !Number.isFinite(playerPos.y)
-        ) {
+        const movement = await movePlayerTo(
+          Number(destination.position.x),
+          Number(destination.position.y),
+        );
+        if (!movement.ok) {
           results.push({
-            name: entity?.name,
-            x: Number(entity.x),
-            y: Number(entity.y),
             ok: false,
-            error: "probe_failed",
+            name: entity.name,
+            requested_anchor: entity.anchor,
+            error: movement.error || "movement_failed",
+            movement: movement.movement,
           });
           continue;
         }
-        const targetX = Number(entity.x) + 0.5;
-        const targetY = Number(entity.y) + 0.5;
-        const distance = Math.hypot(targetX - playerPos.x, targetY - playerPos.y);
-        const delayMs = walkDelayMs(distance);
-        if (delayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
-        }
-        const response = await rconCommand(agentBuildCommand([entity]));
-        const data = parseRconJson<any>(
-          response,
-          "RCON build returned invalid JSON",
-        );
-        const entry = data?.results?.[0];
-        if (!entry) {
-          results.push({
-            name: entity?.name,
-            x: Number(entity.x),
-            y: Number(entity.y),
-            ok: false,
-            error: "build_failed",
-          });
-        } else {
-          results.push(entry);
-        }
+        const response = await rconCommand(agentNativeBuildCommand(entity));
+        const result = parseRconJson<any>(response, "RCON build returned invalid JSON");
+        results.push({ ...result, movement: movement.movement });
       }
       return json(res, 200, {
         ok: true,
@@ -2242,7 +2461,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       const results: any[] = [];
       for (const target of trimmed) {
         const probeResponse = await rconCommand(
-          agentMineProbeCommand({ x: Number(target.x), y: Number(target.y) }),
+          agentMineProbeCommand({
+            x: Number(target.x),
+            y: Number(target.y),
+            kind: target.kind,
+            name: target.name,
+          }),
         );
         const probe = parseRconJson<any>(
           probeResponse,
@@ -2275,15 +2499,29 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
           });
           continue;
         }
-        const dx = entityPos.x - playerPos.x;
-        const dy = entityPos.y - playerPos.y;
-        const distance = Math.hypot(dx, dy);
-        const delayMs = walkDelayMs(distance);
-        if (delayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        const movement = await moveNearEntity({
+          x: Number(target.x),
+          y: Number(target.y),
+          kind: target.kind,
+          name: target.name,
+        });
+        if (!movement?.ok) {
+          results.push({
+            x: Number(target.x),
+            y: Number(target.y),
+            ok: false,
+            error: movement?.error || "movement_failed",
+            movement: movement?.movement,
+          });
+          continue;
         }
         const response = await rconCommand(
-          agentMineCommand([{ x: Number(target.x), y: Number(target.y) }]),
+          agentMineCommand([{
+            x: Number(target.x),
+            y: Number(target.y),
+            kind: target.kind,
+            name: target.name,
+          }]),
         );
         const data = parseRconJson<any>(
           response,
@@ -2298,7 +2536,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
             error: "mine_failed",
           });
         } else {
-          results.push(entry);
+          results.push({ ...entry, movement: movement.movement });
           if (entry?.ok) {
             const minedCountRaw = Number(entry?.mined_count);
             const minedCount = Number.isFinite(minedCountRaw)
@@ -2374,33 +2612,41 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
         const targetX = Number(target.x) + 0.5;
         const targetY = Number(target.y) + 0.5;
         const distance = Math.hypot(targetX - playerPos.x, targetY - playerPos.y);
-        const delayMs = walkDelayMs(distance);
-        if (delayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        const steps = Math.max(1, Math.ceil(distance / 0.75));
+        const stepDelayMs = walkDelayMs(distance) / steps;
+        let movedX = playerPos.x;
+        let movedY = playerPos.y;
+        let error: string | null = null;
+        for (let step = 1; step <= steps; step++) {
+          if (stepDelayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, stepDelayMs));
+          }
+          const fraction = step / steps;
+          const nextX = playerPos.x + (targetX - playerPos.x) * fraction;
+          const nextY = playerPos.y + (targetY - playerPos.y) * fraction;
+          const response = await rconCommand(
+            agentMoveStepCommand({
+              x: nextX,
+              y: nextY,
+              direction: directionForVector(nextX - movedX, nextY - movedY),
+            }),
+          );
+          const data = parseRconJson<any>(response, "RCON move step returned invalid JSON");
+          if (!data?.ok) {
+            error = data?.error || "blocked";
+            break;
+          }
+          movedX = data.x;
+          movedY = data.y;
         }
-        const response = await rconCommand(
-          agentMoveCommand({ x: Number(target.x), y: Number(target.y) }),
-        );
-        const data = parseRconJson<any>(
-          response,
-          "RCON move returned invalid JSON",
-        );
-        if (!data || data.ok === false) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: data?.error || "move_failed",
-          });
-        } else {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: true,
-            moved_x: data?.x,
-            moved_y: data?.y,
-          });
-        }
+        results.push({
+          x: Number(target.x),
+          y: Number(target.y),
+          ok: !error,
+          moved_x: movedX,
+          moved_y: movedY,
+          ...(error ? { error } : {}),
+        });
       }
       return json(res, 200, {
         ok: true,
@@ -2468,13 +2714,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
           });
           continue;
         }
-        const distance = Math.hypot(
-          entityPos.x - playerPos.x,
-          entityPos.y - playerPos.y,
-        );
-        const delayMs = walkDelayMs(distance);
-        if (delayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        const movement = await moveNearEntity({
+          x: Number(target.x),
+          y: Number(target.y),
+        });
+        if (!movement?.ok) {
+          results.push({
+            x: Number(target.x),
+            y: Number(target.y),
+            ok: false,
+            error: movement?.error || "movement_failed",
+            movement: movement?.movement,
+          });
+          continue;
         }
         const response = await rconCommand(
           agentRotateCommand([{ x: Number(target.x), y: Number(target.y) }]),
@@ -2492,7 +2744,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
             error: "rotate_failed",
           });
         } else {
-          results.push(entry);
+          results.push({ ...entry, movement: movement.movement });
         }
       }
       return json(res, 200, {
@@ -2561,13 +2813,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
           });
           continue;
         }
-        const distance = Math.hypot(
-          entityPos.x - playerPos.x,
-          entityPos.y - playerPos.y,
-        );
-        const delayMs = walkDelayMs(distance);
-        if (delayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        const movement = await moveNearEntity({
+          x: Number(target.x),
+          y: Number(target.y),
+        });
+        if (!movement?.ok) {
+          results.push({
+            x: Number(target.x),
+            y: Number(target.y),
+            ok: false,
+            error: movement?.error || "movement_failed",
+            movement: movement?.movement,
+          });
+          continue;
         }
         const response = await rconCommand(
           agentSetRecipeCommand([
@@ -2587,7 +2845,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
             error: "set_recipe_failed",
           });
         } else {
-          results.push(entry);
+          results.push({ ...entry, movement: movement.movement });
         }
       }
       return json(res, 200, {
@@ -2689,13 +2947,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
           data: { ok: false, error: "probe_failed" },
         });
       }
-      const distance = Math.hypot(
-        entityPos.x - playerPos.x,
-        entityPos.y - playerPos.y,
-      );
-      const delayMs = walkDelayMs(distance);
-      if (delayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      const movement = await moveNearEntity({ x: Number(to.x), y: Number(to.y) });
+      if (!movement?.ok) {
+        return json(res, 200, {
+          ok: true,
+          data: { ok: false, error: movement?.error || "movement_failed", movement: movement?.movement },
+        });
       }
       const response = await rconCommand(
         agentInsertCommand({ x: Number(to.x), y: Number(to.y), item, count }),
@@ -2704,7 +2961,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
         response,
         "RCON insert returned invalid JSON",
       );
-      return json(res, 200, { ok: true, data });
+      return json(res, 200, { ok: true, data: { ...data, movement: movement.movement } });
     } catch (err: any) {
       return json(res, 500, { error: err?.message || "RCON command failed" });
     }
@@ -2765,13 +3022,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
           data: { ok: false, error: "probe_failed" },
         });
       }
-      const distance = Math.hypot(
-        entityPos.x - playerPos.x,
-        entityPos.y - playerPos.y,
-      );
-      const delayMs = walkDelayMs(distance);
-      if (delayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      const movement = await moveNearEntity({ x: Number(from.x), y: Number(from.y) });
+      if (!movement?.ok) {
+        return json(res, 200, {
+          ok: true,
+          data: { ok: false, error: movement?.error || "movement_failed", movement: movement?.movement },
+        });
       }
       const response = await rconCommand(
         agentExtractCommand({
@@ -2785,7 +3041,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
         response,
         "RCON extract returned invalid JSON",
       );
-      return json(res, 200, { ok: true, data });
+      return json(res, 200, { ok: true, data: { ...data, movement: movement.movement } });
     } catch (err: any) {
       return json(res, 500, { error: err?.message || "RCON command failed" });
     }
@@ -2818,10 +3074,55 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       } catch {
         // Leave as raw string if it isn't JSON.
       }
+      data = normalizeEntityData(data);
       return json(res, 200, {
         ok: true,
         data,
         truncated: targets.length > trimmed.length,
+      });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (
+    req.method === "POST" &&
+    url.pathname === "/api/agent/observe/placement"
+  ) {
+    let body: any = null;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) return json(res, 409, { error: "RCON not configured" });
+    if (!state.rcon.connected) return json(res, 409, { error: "RCON not connected" });
+    const placements = Array.isArray(body?.placements) ? body.placements : [];
+    const valid = placements.slice(0, AGENT_MAX_ACTIONS).filter(
+      (item: any) =>
+        typeof item?.name === "string" &&
+        Number.isFinite(Number(item?.anchor?.x)) &&
+        Number.isFinite(Number(item?.anchor?.y)),
+    ) as BuildRequest[];
+    try {
+      const results = [];
+      for (const item of valid) {
+        const result = parseRconJson<any>(
+          await rconCommand(agentNativeBuildCommand(item, true)),
+          "RCON placement analysis returned invalid JSON",
+        );
+        const diagnostics = result?.diagnostics;
+        if (diagnostics) {
+          diagnostics.nearest_valid_positions = arrayOrEmpty(diagnostics.nearest_valid_positions);
+          if (diagnostics.terrain) diagnostics.terrain.tile_names = arrayOrEmpty(diagnostics.terrain.tile_names);
+          if (diagnostics.collision) diagnostics.collision.possible_blockers = arrayOrEmpty(diagnostics.collision.possible_blockers);
+        }
+        results.push(result);
+      }
+      return json(res, 200, {
+        ok: true,
+        data: { results },
+        truncated: placements.length > valid.length,
       });
     } catch (err: any) {
       return json(res, 500, { error: err?.message || "RCON command failed" });
@@ -2850,13 +3151,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     const y = clampInt(window.y, 0, -1000000, 1000000);
     try {
       const response = await rconCommand(
-        agentResourcesCommand({ x, y, radius }),
+        agentChartedResourcesCommand({ x, y, radius }),
+        15_000,
       );
       let data: any = response;
       try {
         data = JSON.parse(response);
       } catch {
         // Leave as raw string if it isn't JSON.
+      }
+      if (data && typeof data === "object") {
+        data.patches = arrayOrEmpty(data.patches);
+        data.shoreline_candidates = arrayOrEmpty(data.shoreline_candidates);
       }
       return json(res, 200, { ok: true, data });
     } catch (err: any) {
@@ -2892,6 +3198,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       } catch {
         // Leave as raw string if it isn't JSON.
       }
+      data = normalizePrototypeData(data);
       if (data && typeof data === "object" && data.ok === false) {
         return json(res, 400, { error: data?.error || "Unknown entity", data });
       }
@@ -2959,6 +3266,24 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       return json(res, 200, { ok: true, response });
     } catch (err: any) {
       return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/server/save") {
+    if (!getRunningPid()) {
+      return json(res, 409, { error: "Server not running" });
+    }
+    if (!rconConfigured()) {
+      return json(res, 409, { error: "RCON not configured" });
+    }
+    if (!state.rcon.connected) {
+      return json(res, 409, { error: "RCON not connected" });
+    }
+    try {
+      const response = await rconCommand("/save", 30_000);
+      return json(res, 200, { ok: true, save: state.save, response });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "Failed to save game" });
     }
   }
 
