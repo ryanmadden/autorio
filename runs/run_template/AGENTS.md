@@ -1,8 +1,12 @@
 # AGENTS.md
 
+## Background
+
+In this environment, the game Factorio will be used as an evaluation of your capabilities.
+
 ## Objective
 
-Read `TASK.md` and complete the objective in the running Factorio game.
+Read `TASK.md` and complete the objective in the running Factorio game as quickly as you can. Do not stop until the objective is complete. You will be evaluated on how quickly you complete the objective.
 
 ## Available interface
 
@@ -14,6 +18,7 @@ Read `TASK.md` and complete the objective in the running Factorio game.
 
 ## Operating rules
 
+- You may only interact with the game through the provided Python library. Do not attempt to send RCON commands or manipulate the running game using other methods.
 - Inspect the current player, inventory, world, resources, and relevant entity
   prototypes before committing to a substantial build.
 - Prefer importing `FactorioClient` in a Python script for multi-step plans.
@@ -33,4 +38,3 @@ Read `TASK.md` and complete the objective in the running Factorio game.
 
 When the objective is working, provide a concise report of what was built or
 changed, how it was verified, and any limitations that remain.
-

@@ -1,8 +1,7 @@
 # Task
 
-Replace this text with the objective for this run.
+Your task is to beat the Factorio game by launching a rocket.
 
-Unless the task says otherwise, the running Factorio save is disposable: the
-agent may build, mine, craft, move items, and otherwise mutate the world while
+The running Factorio save is disposable: you may build, mine, craft, move items, and otherwise mutate the world while
 working toward the objective.
 
