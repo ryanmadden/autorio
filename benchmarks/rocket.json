@@ -1,0 +1,24 @@
+{
+  "id": "rocket",
+  "title": "Launch a rocket — base game",
+  "task": "Build a factory and launch a rocket in base Factorio. Use only the provided Python interface. Keep working until the rocket has actually launched. Verify production and research as you progress.",
+  "map_gen": {
+    "seed": 424242,
+    "peaceful_mode": true,
+    "autoplace_controls": { "enemy-base": { "frequency": 0, "size": 0 } }
+  },
+  "always_day": true,
+  "starting_items": { "iron-plate": 8, "burner-mining-drill": 1, "stone-furnace": 1 },
+  "max_seconds": 28800,
+  "sample_seconds": 10,
+  "milestones": [
+    { "id": "first-plate", "kind": "production", "name": "iron-plate", "count": 1 },
+    { "id": "first-science", "kind": "production", "name": "automation-science-pack", "count": 1 },
+    { "id": "automation", "kind": "research", "name": "automation" },
+    { "id": "logistic-science", "kind": "production", "name": "logistic-science-pack", "count": 1 },
+    { "id": "chemical-science", "kind": "production", "name": "chemical-science-pack", "count": 1 },
+    { "id": "rocket-silo", "kind": "research", "name": "rocket-silo" },
+    { "id": "rocket-launched", "kind": "rockets", "count": 1 }
+  ],
+  "completion": "rocket-launched"
+}

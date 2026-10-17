@@ -1,0 +1,16 @@
+{
+  "id": "smoke",
+  "title": "First gear — integration smoke test",
+  "task": "Craft one iron gear wheel using the provided Python library. Observe the player first, submit the craft action, and verify the gear appears in inventory. This is a short integration test; you do not need to build a factory.",
+  "map_gen": {
+    "seed": 424242,
+    "peaceful_mode": true,
+    "autoplace_controls": { "enemy-base": { "frequency": 0, "size": 0 } }
+  },
+  "always_day": true,
+  "starting_items": { "iron-plate": 8, "burner-mining-drill": 1, "stone-furnace": 1 },
+  "max_seconds": 300,
+  "sample_seconds": 2,
+  "milestones": [{ "id": "first-gear", "kind": "production", "name": "iron-gear-wheel", "count": 1 }],
+  "completion": "first-gear"
+}

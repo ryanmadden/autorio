@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Run Details · Autorio</title><link rel="stylesheet" href="/runs.css"></head>
+<body><main>
+    <header><div><span class="eyebrow">FACTORIO · AGENT RUNS</span><h1>Run Details</h1></div><nav><a href="/">← All runs</a><a id="recordingLink" hidden>Recording view</a></nav></header>
+    <p id="error" role="alert"></p><div id="runContent" hidden>
+    <section id="current" aria-label="Run progress">
+      <div class="section-title"><h2 id="runTitle">No active run</h2><button id="resume" type="button" hidden>Resume run</button><button id="stop" type="button" disabled>Stop &amp; save</button></div>
+      <div class="stats"><div><span>STATE</span><strong id="state">—</strong></div><div><span>ACTIVE PLAY TIME</span><strong id="elapsed">—</strong></div><div><span>GAME TIME</span><strong id="gameTime">—</strong></div><div><span>AGENT</span><strong id="agent">—</strong></div></div>
+      <p id="reason" class="muted"></p>
+      <div id="milestones" class="milestones"></div>
+    </section>
+    <section aria-label="Run information"><h2>Run information</h2><dl id="runInfo" class="run-info"></dl><p id="task" class="muted"></p><p id="tokenUsage"></p><details><summary>Versions and configuration hashes</summary><pre id="configuration"></pre></details></section>
+    <section id="segmentsPanel" hidden><h2>Run segments</h2><p id="checkpoint" class="muted"></p><p id="resumeNote" class="muted"></p><div id="segments"></div></section>
+    <section id="videoPanel" hidden><h2>Timelapse recording</h2><p id="videoStatus" class="muted"></p><video id="runVideo" controls playsinline preload="metadata" hidden></video><p><a id="videoDownload" hidden>Download 6× timelapse</a></p></section>
+    <section id="productionChartPanel" aria-label="Production graph">
+      <div class="section-title"><h2>Production over time</h2><a id="telemetryDownload">Download telemetry</a></div>
+      <form><label>Item<select id="chartItem"></select></label><label>Measure<select id="chartMeasure"><option value="total">Total produced</option><option value="rate">Produced per game minute</option></select></label><label>Time axis<select id="chartTime"><option value="wall">Active play time</option><option value="game">Game time</option></select></label></form>
+      <div id="chartLegend" class="chart-legend" aria-label="Production series"></div>
+      <svg id="productionChart" viewBox="0 0 900 300" role="img" aria-label="Production over time with science research markers"></svg>
+      <p id="chartNote" class="muted">Waiting for telemetry.</p><div id="researchMarkers" class="milestones"></div>
+    </section>
+    <section class="activity" aria-label="Agent activity"><div class="section-title"><h2>Live activity</h2><label class="check"><input id="follow" type="checkbox" checked> Follow</label></div><pre id="activity" tabindex="0">Select a run to view activity.</pre></section>
+    <section id="productionPanel"><h2>Production since run start</h2><div id="production" class="production-list"></div></section>
+    </div></main><script type="module" src="/run.js"></script></body></html>

@@ -1,55 +1,41 @@
 import { createServer, IncomingMessage, ServerResponse } from "http";
-import { spawn } from "child_process";
+import {obsStatus} from "./obs.js";
+import { spawn, execFileSync } from "child_process";
 import fsSync from "fs";
 import { promises as fs } from "fs";
 import path from "path";
 import net from "net";
 import { randomUUID } from "crypto";
 
-const PORT = process.env.AUTORIO_PORT
-  ? Number(process.env.AUTORIO_PORT)
-  : 3000;
-const ROOT = process.cwd();
+import {
+  ROOT, PORT, DATA_DIR, FACTORIO_BIN, SAVES_DIR, MANAGER_PROFILE,
+  RCON_HOST, RCON_PORT, RCON_PASSWORD, factorioEnv, prepareProfile,
+  profileArgs, createMap, factorioVersion, requireSteam, execFileAsync,
+} from "./runtime.js";
+import {NativeController} from "./native-control.js";
+import { RunManager } from "./runs.js";
 
-function loadEnvFile() {
-  const envPath = path.join(ROOT, ".env");
-  if (!fsSync.existsSync(envPath)) return;
-  const content = fsSync.readFileSync(envPath, "utf8");
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const idx = line.indexOf("=");
-    if (idx <= 0) continue;
-    const key = line.slice(0, idx).trim();
-    let value = line.slice(idx + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    if (process.env[key] === undefined) process.env[key] = value;
-  }
+fsSync.mkdirSync(DATA_DIR, { recursive: true });
+const PID_FILE = path.join(DATA_DIR, "factorio.pid");
+const LOCK_FILE = path.join(DATA_DIR, "manager.pid");
+if (fsSync.existsSync(LOCK_FILE)) {
+  const owner = Number(fsSync.readFileSync(LOCK_FILE, "utf8"));
+  if (Number.isInteger(owner) && owner > 0 && isPidRunning(owner)) throw new Error(`Autorio manager already running (PID ${owner}).`);
+  fsSync.unlinkSync(LOCK_FILE);
 }
-
-loadEnvFile();
-
-const FACTORIO_DIR = path.join(ROOT, "factorio");
-const SAVES_DIR = path.join(FACTORIO_DIR, "saves");
-const FACTORIO_BIN = path.join(FACTORIO_DIR, "bin", "x64", "factorio");
-const MAP_GEN_SETTINGS = path.join(FACTORIO_DIR, "data", "map-gen-settings.json");
-const PID_FILE = path.join(ROOT, "factorio.pid");
-
+fsSync.writeFileSync(LOCK_FILE, String(process.pid), { flag: "wx" });
+process.on("exit", () => {
+  try { if (fsSync.readFileSync(LOCK_FILE, "utf8") === String(process.pid)) fsSync.unlinkSync(LOCK_FILE); } catch { /* already removed */ }
+});
 const LOG_BUFFER_LIMIT = 500;
 const USAGE_SAMPLE_MS = 2000;
-const RCON_CHECK_MS = 5000;
-
-const RCON_HOST = process.env.RCON_HOST || "127.0.0.1";
-const RCON_PORT = process.env.RCON_PORT ? Number(process.env.RCON_PORT) : null;
-const RCON_PASSWORD = process.env.RCON_PASSWORD || "";
+const RCON_CHECK_MS = 1000;
+const INTERNAL_JOB_KEY = randomUUID();
+let gameLog: fsSync.WriteStream | null = null;
+let activeSavePath: string | null = null;
+let activeProfile: string | null = null;
 
 const RCON_AUTH_ID = 0x1234;
-const ALWAYS_DAY_COMMAND = "/c game.surfaces[1].always_day=true";
 
 const AGENT_DEFAULT_RADIUS = 12;
 const AGENT_MAX_INVENTORY_SLOTS = 200;
@@ -57,7 +43,6 @@ const AGENT_MAX_EQUIPMENT_SLOTS = 50;
 const AGENT_MAX_RECIPES = 300;
 const AGENT_MAX_RESEARCH = 200;
 const AGENT_MAX_ACTIONS = 50;
-const CHARACTER_WALK_SPEED_TPS = 8.9;
 const API_SCHEMA_VERSION = 2;
 const JOB_RETENTION_MS = 60 * 60 * 1000;
 
@@ -133,16 +118,13 @@ function normalizePrototypeData(data: any) {
   return data;
 }
 
-function walkDelayMs(distance: number) {
-  if (!Number.isFinite(distance) || distance <= 0) return 0;
-  return Math.max(0, Math.round((distance / CHARACTER_WALK_SPEED_TPS) * 1000));
-}
-
 function readPidFile(): number | null {
   try {
     const text = fsSync.readFileSync(PID_FILE, "utf8").trim();
     const pid = Number(text);
-    return Number.isFinite(pid) ? pid : null;
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    const command = execFileSync("/bin/ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 2000 });
+    return command.includes(FACTORIO_BIN) && command.includes(`--config ${DATA_DIR}/`) ? pid : null;
   } catch {
     return null;
   }
@@ -180,11 +162,6 @@ type LogLine = {
   ts: string;
   stream: "stdout" | "stderr";
   line: string;
-};
-
-type UsageSnapshot = {
-  totalJiffies: number;
-  procJiffies: number;
 };
 
 type UsageStats = {
@@ -226,9 +203,7 @@ type ServerState = {
   logs: LogLine[];
   logTail: { stdout: string; stderr: string };
   usage: UsageStats;
-  usagePrev: UsageSnapshot | null;
   rcon: RconState;
-  alwaysDayPending: boolean;
 };
 
 const state: ServerState = {
@@ -240,7 +215,6 @@ const state: ServerState = {
   logs: [],
   logTail: { stdout: "", stderr: "" },
   usage: { cpuPercent: null, rssBytes: null },
-  usagePrev: null,
   rcon: {
     socket: null,
     connected: false,
@@ -250,7 +224,6 @@ const state: ServerState = {
     pending: new Map(),
     nextId: 0x2000,
   },
-  alwaysDayPending: false,
 };
 
 let saveCreationInProgress = false;
@@ -335,45 +308,8 @@ function normalizeSaveFilename(value: unknown): string {
 
 async function createSave(save: string): Promise<void> {
   const savePath = path.join(SAVES_DIR, save);
-  await fs.mkdir(SAVES_DIR, { recursive: true });
-  await fs.access(MAP_GEN_SETTINGS);
-  try {
-    await fs.access(savePath);
-    throw new Error("Save already exists");
-  } catch (err: any) {
-    if (err?.message === "Save already exists") throw err;
-    if (err?.code !== "ENOENT") throw err;
-  }
-
-  return new Promise<void>((resolve, reject) => {
-    const proc = spawn(
-      FACTORIO_BIN,
-      ["--create", savePath, "--map-gen-settings", MAP_GEN_SETTINGS],
-      { cwd: FACTORIO_DIR, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let stdout = "";
-    let stderr = "";
-    proc.stdout?.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
-    });
-    proc.stderr?.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-    });
-    proc.once("error", reject);
-    proc.once("close", (code, signal) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      const detail = stderr.trim() || stdout.trim();
-      reject(
-        new Error(
-          detail ||
-            `Factorio save creation failed${signal ? ` (${signal})` : ` (exit ${code})`}`,
-        ),
-      );
-    });
-  });
+  if (fsSync.existsSync(savePath)) throw new Error("Save already exists");
+  await createMap(savePath, MANAGER_PROFILE, { seed: 424242, peaceful_mode: true });
 }
 
 function rconConfigured(): boolean {
@@ -476,6 +412,7 @@ function agentBuildDestinationCommand(item: BuildRequest): string {
     `local name=${luaString(item.name)}`, `local ax=${item.anchor.x}`, `local ay=${item.anchor.y}`, `local dir=${direction}`,
     "local proto=prototypes.entity[name] if not proto then done{ok=false,error='unknown_entity'} return end",
     "local w=proto.tile_width local h=proto.tile_height if dir==4 or dir==12 then w,h=h,w end local cx=ax+w/2 local cy=ay+h/2",
+    "local dx=cx-p.position.x local dy=cy-p.position.y if dx*dx+dy*dy<=p.build_distance*p.build_distance and p.surface.can_place_entity{name=name,position={cx,cy},direction=dir,force=p.force,build_check_type=defines.build_check_type.manual} then done{ok=true,position={x=p.position.x,y=p.position.y},center={x=cx,y=cy}} return end",
     "local margin=1 local offsets={{-(w/2+margin),0},{w/2+margin,0},{0,-(h/2+margin)},{0,h/2+margin},{-(w/2+margin),-(h/2+margin)},{w/2+margin,-(h/2+margin)},{-(w/2+margin),h/2+margin},{w/2+margin,h/2+margin}}",
     "local best=nil local best_d=nil for _,o in pairs(offsets) do local tx=cx+o[1] local ty=cy+o[2] local pos=p.surface.find_non_colliding_position('character',{tx,ty},0.75,0.1) if pos then local reach_dx=pos.x-cx local reach_dy=pos.y-cy if reach_dx*reach_dx+reach_dy*reach_dy<=p.build_distance*p.build_distance then local dx=pos.x-p.position.x local dy=pos.y-p.position.y local d=dx*dx+dy*dy if not best_d or d<best_d then best=pos best_d=d end end end end",
     "if not best then done{ok=false,error='no_reachable_staging_position'} return end done{ok=true,position=best,center={x=cx,y=cy}}",
@@ -820,404 +757,14 @@ function agentRecipesCommand(params: {
   return parts.join(" ");
 }
 
-function agentBuildCommand(
-  items: Array<{ name: string; x: number; y: number; direction?: number }>,
-): string {
-  const parts = [
-    "/sc",
-    "local s=game.surfaces[1]",
-    "local player=game.players[1]",
-    "local force=player and player.force or game.forces.player or game.forces[1]",
-    "local function esc(v)",
-    "if v==nil then return 'null' end",
-    "local t=type(v)",
-    'if t==\"string\" then',
-    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    'elseif t==\"number\" or t==\"boolean\" then',
-    "return tostring(v)",
-    "else",
-    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    "end",
-    "end",
-    "local results={}",
-    "local function move_near(x,y)",
-    "if not player or not player.character then return false,'no_character' end",
-    "local function is_too_close(pos)",
-    "if not pos then return true end",
-    "local dx=pos.x - x",
-    "local dy=pos.y - y",
-    "return (dx*dx + dy*dy) < 0.49",
-    "end",
-    "local safe_pos=s.find_non_colliding_position('character',{x=x,y=y},6,0.5)",
-    "if is_too_close(safe_pos) then",
-    "local offsets={{1.5,0},{-1.5,0},{0,1.5},{0,-1.5},{1.5,1.5},{-1.5,1.5},{1.5,-1.5},{-1.5,-1.5}}",
-    "for i=1,#offsets do",
-    "local off=offsets[i]",
-    "local candidate=s.find_non_colliding_position('character',{x=x+off[1],y=y+off[2]},6,0.5)",
-    "if not is_too_close(candidate) then",
-    "safe_pos=candidate",
-    "break",
-    "end",
-    "end",
-    "end",
-    "if safe_pos then player.teleport(safe_pos) return true end",
-    "return false,'out_of_reach'",
-    "end",
-    "local function place(name,x,y,dir)",
-    "if not player or not player.character then return {name=name,x=x,y=y,ok=false,error='no_character'} end",
-    "local moved,move_err=move_near(x,y)",
-    "if not moved then return {name=name,x=x,y=y,ok=false,error=move_err or 'out_of_reach'} end",
-    "local function take_item()",
-    "local removed=player.remove_item{name=name,count=1}",
-    "if removed < 1 then return 0,'missing_item' end",
-    "return removed,nil",
-    "end",
-    "local can_surface=s.can_place_entity{name=name,position={x=x,y=y},direction=dir,force=force}",
-    "local can_player=player.can_place_entity and player.can_place_entity{name=name,position={x=x,y=y},direction=dir,force=force} or can_surface",
-    "if not can_player then",
-    "if can_surface then",
-    "return {name=name,x=x,y=y,ok=false,error='out_of_reach',detail='Target is out of reach'}",
-    "end",
-    "local colliders=s.find_entities_filtered{area={{x-1,y-1},{x+2,y+2}}} or {}",
-    "local blocking=nil",
-    "local only_resources=true",
-    "for _,c in pairs(colliders) do",
-    "if c.valid then",
-    "if c.type ~= 'resource' then",
-    "only_resources=false",
-    "blocking={name=c.name,x=math.floor(c.position.x),y=math.floor(c.position.y)}",
-    "break",
-    "end",
-    "end",
-    "end",
-    "if only_resources then",
-    "local removed,remove_err=take_item()",
-    "if remove_err then return {name=name,x=x,y=y,ok=false,error=remove_err} end",
-    "local ok_res,created=pcall(function()",
-    "return s.create_entity{ name=name, position={x=x,y=y}, direction=dir, force=force }",
-    "end)",
-    "if ok_res and created then",
-    "return {name=name,x=x,y=y,ok=true,center_x=created.position.x,center_y=created.position.y,direction=created.direction}",
-    "elseif ok_res then",
-    "return {name=name,x=x,y=y,ok=true}",
-    "else",
-    "player.insert{name=name,count=removed}",
-    "return {name=name,x=x,y=y,ok=false,error='create_failed',detail=tostring(created)}",
-    "end",
-    "end",
-    "local tile=s.get_tile(x,y)",
-    "local tile_name=tile and tile.name or 'unknown'",
-    "if blocking then",
-    "return {name=name,x=x,y=y,ok=false,error='collision',detail='Blocked by '..blocking.name..' at '..blocking.x..','..blocking.y,blocking_entity=blocking}",
-    "else",
-    "return {name=name,x=x,y=y,ok=false,error='invalid_position',tile=tile_name,detail='Cannot place on '..tile_name}",
-    "end",
-    "end",
-    "local removed,remove_err=take_item()",
-    "if remove_err then return {name=name,x=x,y=y,ok=false,error=remove_err} end",
-    "local ok,result=pcall(function()",
-    "return s.create_entity{ name=name, position={x=x,y=y}, direction=dir, force=force }",
-    "end)",
-    "if ok and result then return {name=name,x=x,y=y,ok=true,center_x=result.position.x,center_y=result.position.y,direction=result.direction} end",
-    "if ok then return {name=name,x=x,y=y,ok=true} end",
-    "player.insert{name=name,count=removed}",
-    "return {name=name,x=x,y=y,ok=false,error='create_failed',detail=tostring(result)}",
-    "end",
-  ];
-  for (const item of items) {
-    const dir = item.direction ?? 0;
-    parts.push(
-      `table.insert(results,place(${luaString(item.name)},${item.x},${item.y},${dir}))`,
-    );
-  }
-  parts.push(
-    "local out={}",
-    "for i=1,#results do",
-    "local r=results[i]",
-    "local entry='{\"name\":'..esc(r.name)..',\"x\":'..r.x..',\"y\":'..r.y..',\"ok\":'..tostring(r.ok)",
-    "if r.error then entry=entry..',\"error\":'..esc(r.error) end",
-    "if r.detail then entry=entry..',\"detail\":'..esc(r.detail) end",
-    "if r.tile then entry=entry..',\"tile\":'..esc(r.tile) end",
-    "if r.blocking_entity then",
-    "entry=entry..',\"blocking_entity\":{\"name\":'..esc(r.blocking_entity.name)..',\"x\":'..r.blocking_entity.x..',\"y\":'..r.blocking_entity.y..'}'",
-    "end",
-    "if r.center_x then entry=entry..',\"center_x\":'..esc(r.center_x)..',\"center_y\":'..esc(r.center_y) end",
-    "if r.direction then entry=entry..',\"direction\":'..esc(r.direction) end",
-    "entry=entry..'}'",
-    "table.insert(out,entry)",
-    "end",
-    "local results_json='['..table.concat(out,',')..']'",
-    "rcon.print('{\"results\":'..results_json..'}')",
-  );
-  return parts.join(" ");
-}
-
 type EntityTarget = { x: number; y: number; kind?: "resource" | "entity"; name?: string };
 
-function agentMineCommand(targets: EntityTarget[]): string {
-  const parts = [
-    "/sc",
-    "local s=game.surfaces[1]",
-    "local player=game.players[1]",
-    'if not player then rcon.print(\'{"error":"No player"}\') return end',
-    "local function esc(v)",
-    "if v==nil then return 'null' end",
-    "local t=type(v)",
-    'if t==\"string\" then',
-    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    'elseif t==\"number\" or t==\"boolean\" then',
-    "return tostring(v)",
-    "else",
-    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    "end",
-    "end",
-    "local results={}",
-    "local function find_entity(x,y,kind,wanted_name) local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.minable and cand.type~='character' and cand.type~='item-entity' and cand.type~='corpse' and (not kind or (kind=='resource' and cand.type=='resource') or (kind=='entity' and cand.type~='resource')) and (not wanted_name or cand.name==wanted_name) then local dx=cand.position.x-(x+0.5) local dy=cand.position.y-(y+0.5) local score=(cand.type=='resource' and 0 or 100)+(wanted_name and 1000 or 0)-dx*dx-dy*dy table.insert(candidates,{entity=cand,score=score,key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end) return candidates[1] and candidates[1].entity or nil end",
-    "local function ensure_reach(entity)",
-    "if not player.character then return false,'no_character' end",
-    "if player.can_reach_entity and player.can_reach_entity(entity) then return true end",
-    "return false,'out_of_reach'",
-    "end",
-    "local function estimate_mined_count(entity)",
-    "local props=entity.prototype and entity.prototype.mineable_properties or nil",
-    "local total=0",
-    "if props and props.products then",
-    "for _,prod in pairs(props.products) do",
-    "local amt=prod.amount",
-    "if not amt then",
-    "if prod.amount_min and prod.amount_max then amt=(prod.amount_min+prod.amount_max)/2 end",
-    "if not amt and prod.amount_min then amt=prod.amount_min end",
-    "if not amt and prod.amount_max then amt=prod.amount_max end",
-    "end",
-    "if not amt then amt=1 end",
-    "total=total+amt",
-    "end",
-    "end",
-    "if total <= 0 then total = 1 end",
-    "return total",
-    "end",
-    "local function mine(x,y,kind,wanted_name)",
-    "local e=find_entity(x,y,kind,wanted_name)",
-    "if not e then return {x=x,y=y,requested_tile={x=x,y=y},ok=false,error=kind=='resource' and 'no_resource' or 'no_entity'} end",
-    "local ename=e.name",
-    "if not e.minable then return {x=x,y=y,name=ename,ok=false,error='not_minable'} end",
-    "local can_reach,reach_err=ensure_reach(e)",
-    "if not can_reach then return {x=x,y=y,name=ename,ok=false,error=reach_err or 'out_of_reach'} end",
-    "local mined_count=estimate_mined_count(e)",
-    "local ok,err=pcall(function() player.mine_entity(e) end)",
-    "if ok then return {x=x,y=y,name=ename,ok=true,mined_count=mined_count} end",
-    "return {x=x,y=y,name=ename,ok=false,error=tostring(err)}",
-    "end",
-  ];
-  for (const target of targets) {
-    parts.push(`table.insert(results,mine(${target.x},${target.y},${target.kind ? luaString(target.kind) : "nil"},${target.name ? luaString(target.name) : "nil"}))`);
-  }
-  parts.push(
-    "local out={}",
-    "for i=1,#results do",
-    "local r=results[i]",
-    "local entry='{\"x\":'..r.x..',\"y\":'..r.y..',\"ok\":'..tostring(r.ok)",
-    "if r.name then entry=entry..',\"name\":'..esc(r.name) end",
-    "if r.error then entry=entry..',\"error\":'..esc(r.error) end",
-    "if r.mined_count then entry=entry..',\"mined_count\":'..esc(r.mined_count) end",
-    "entry=entry..'}'",
-    "table.insert(out,entry)",
-    "end",
-    "local results_json='['..table.concat(out,',')..']'",
-    "rcon.print('{\"results\":'..results_json..'}')",
-  );
-  return parts.join(" ");
-}
-
-function agentMineProbeCommand(target: EntityTarget): string {
-  const parts = [
-    "/sc",
-    "local s=game.surfaces[1]",
-    "local player=game.players[1]",
-    'if not player then rcon.print(\'{"error":"No player"}\') return end',
-    "local function esc(v)",
-    "if v==nil then return 'null' end",
-    "local t=type(v)",
-    'if t==\"string\" then',
-    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    'elseif t==\"number\" or t==\"boolean\" then',
-    "return tostring(v)",
-    "else",
-    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    "end",
-    "end",
-    `local kind=${target.kind ? luaString(target.kind) : "nil"}`,
-    `local wanted_name=${target.name ? luaString(target.name) : "nil"}`,
-    "local function find_entity(x,y) local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.minable and cand.type~='character' and cand.type~='item-entity' and cand.type~='corpse' and (not kind or (kind=='resource' and cand.type=='resource') or (kind=='entity' and cand.type~='resource')) and (not wanted_name or cand.name==wanted_name) then local dx=cand.position.x-(x+0.5) local dy=cand.position.y-(y+0.5) local score=(cand.type=='resource' and 0 or 100)+(wanted_name and 1000 or 0)-dx*dx-dy*dy table.insert(candidates,{entity=cand,score=score,key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end) return candidates[1] and candidates[1].entity or nil end",
-    `local target_x=${target.x}`,
-    `local target_y=${target.y}`,
-    "local e=find_entity(target_x,target_y)",
-    "if not e then rcon.print(helpers.table_to_json{error=kind=='resource' and 'no_resource' or 'no_entity'}) return end",
-    "local out={}",
-    "table.insert(out,'\"player\":{\"x\":'..esc(player.position.x)..',\"y\":'..esc(player.position.y)..'}')",
-    "table.insert(out,'\"entity\":{\"name\":'..esc(e.name)..',\"x\":'..esc(e.position.x)..',\"y\":'..esc(e.position.y)..',\"minable\":'..esc(e.minable)..'}')",
-    "rcon.print('{'..table.concat(out,',')..'}')",
-  ];
-  return parts.join(" ");
-}
-
-function agentPlayerPositionCommand(): string {
-  const parts = [
-    "/sc",
-    "local player=game.players[1]",
-    'if not player then rcon.print(\'{"error":"No player"}\') return end',
-    "rcon.print('{\"player\":{\"x\":'..player.position.x..',\"y\":'..player.position.y..'}}')",
-  ];
-  return parts.join(" ");
-}
-
-function agentInteractionDestinationCommand(target: EntityTarget) {
-  return [
-    "/sc", "local s=game.surfaces[1]", "local p=game.players[1]", "local function done(v) rcon.print(helpers.table_to_json(v)) end",
-    "if not p or not p.character then done{ok=false,error='no_character'} return end",
-    `local x=${target.x}`, `local y=${target.y}`, `local kind=${target.kind ? luaString(target.kind) : "nil"}`, `local wanted_name=${target.name ? luaString(target.name) : "nil"}`,
-    "local found=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,candidate in pairs(found) do if candidate.valid and candidate~=p.character and candidate.type~='item-entity' and candidate.type~='corpse' and (not kind or (kind=='resource' and candidate.type=='resource') or (kind=='entity' and candidate.type~='resource')) and (not wanted_name or candidate.name==wanted_name) then local dx=candidate.position.x-(x+0.5) local dy=candidate.position.y-(y+0.5) local score=(candidate.type=='resource' and 0 or 100)+(wanted_name and 1000 or 0)-dx*dx-dy*dy table.insert(candidates,{entity=candidate,score=score,key=candidate.name..':'..candidate.position.x..':'..candidate.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end) local e=candidates[1] and candidates[1].entity or nil if not e then done{ok=false,error=kind=='resource' and 'no_resource' or 'no_entity'} return end",
-    "if p.can_reach_entity(e) then done{ok=true,position={x=p.position.x,y=p.position.y},entity={name=e.name,center={x=e.position.x,y=e.position.y}}} return end",
-    "local pos=s.find_non_colliding_position('character',e.position,math.max(1,p.reach_distance-0.25),0.1) if not pos then done{ok=false,error='no_reachable_staging_position'} return end",
-    "done{ok=true,position={x=pos.x,y=pos.y},entity={name=e.name,center={x=e.position.x,y=e.position.y}}}",
-  ].join(" ");
-}
-
 async function moveNearEntity(target: EntityTarget) {
-  const destination = parseRconJson<any>(
-    await rconCommand(agentInteractionDestinationCommand(target)),
-    "RCON interaction destination returned invalid JSON",
-  );
-  if (!destination?.ok) return destination;
-  const movement = await movePlayerTo(
-    Number(destination.position.x),
-    Number(destination.position.y),
-  );
-  return { ...movement, entity: destination.entity };
+  return nativeAction({kind:"approach",target:{...target,kind:target.kind || "entity"}});
 }
 
-function agentEntityProbeCommand(target: { x: number; y: number }): string {
-  const parts = [
-    "/sc",
-    "local s=game.surfaces[1]",
-    "local player=game.players[1]",
-    'if not player then rcon.print(\'{"error":"No player"}\') return end',
-    "local function esc(v)",
-    "if v==nil then return 'null' end",
-    "local t=type(v)",
-    'if t==\"string\" then',
-    "return '\"'..v:gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    'elseif t==\"number\" or t==\"boolean\" then',
-    "return tostring(v)",
-    "else",
-    "return '\"'..tostring(v):gsub('\\\\','\\\\\\\\'):gsub('\"','\\\\\"')..'\"'",
-    "end",
-    "end",
-    "local function find_entity(x,y) local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.type~='character' and cand.type~='item-entity' and cand.type~='corpse' then local dx=cand.position.x-(x+0.5) local dy=cand.position.y-(y+0.5) local score=(cand.type=='resource' and 0 or 100)-dx*dx-dy*dy table.insert(candidates,{entity=cand,score=score,key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end) return candidates[1] and candidates[1].entity or nil end",
-    `local target_x=${target.x}`,
-    `local target_y=${target.y}`,
-    "local e=find_entity(target_x,target_y)",
-    "if not e then rcon.print('{\"error\":\"no_entity\"}') return end",
-    "local out={}",
-    "table.insert(out,'\"player\":{\"x\":'..esc(player.position.x)..',\"y\":'..esc(player.position.y)..'}')",
-    "table.insert(out,'\"entity\":{\"name\":'..esc(e.name)..',\"x\":'..esc(e.position.x)..',\"y\":'..esc(e.position.y)..'}')",
-    "rcon.print('{'..table.concat(out,',')..'}')",
-  ];
-  return parts.join(" ");
-}
-
-function agentMoveCommand(target: { x: number; y: number }): string {
-  const parts = [
-    "/sc",
-    "local s=game.surfaces[1]",
-    "local player=game.players[1]",
-    'if not player then rcon.print(\'{"ok":false,"error":"No player"}\') return end',
-    `local x=${target.x}`,
-    `local y=${target.y}`,
-    "if not player.character then rcon.print('{\"ok\":false,\"error\":\"no_character\"}') return end",
-    "local safe_pos=s.find_non_colliding_position('character',{x=x,y=y},6,0.5)",
-    "if not safe_pos then rcon.print('{\"ok\":false,\"error\":\"no_path\"}') return end",
-    "player.teleport(safe_pos)",
-    "local out={}",
-    "table.insert(out,'\"ok\":true')",
-    "table.insert(out,'\"x\":'..safe_pos.x)",
-    "table.insert(out,'\"y\":'..safe_pos.y)",
-    "rcon.print('{'..table.concat(out,',')..'}')",
-  ];
-  return parts.join(" ");
-}
-
-function agentMoveStepCommand(params: {
-  x: number;
-  y: number;
-  direction: number;
-}): string {
-  return [
-    "/sc",
-    "local s=game.surfaces[1]",
-    "local player=game.players[1]",
-    'if not player or not player.character then rcon.print(\'{"ok":false,"error":"no_character"}\') return end',
-    `local x=${params.x}`,
-    `local y=${params.y}`,
-    `local direction=${params.direction}`,
-    "local pos=s.find_non_colliding_position('character',{x=x,y=y},0.75,0.1)",
-    "if not pos then rcon.print('{\"ok\":false,\"error\":\"blocked\"}') return end",
-    "if math.abs(pos.x-x)>0.76 or math.abs(pos.y-y)>0.76 then rcon.print('{\"ok\":false,\"error\":\"blocked\"}') return end",
-    "player.teleport(pos)",
-    "player.character.direction=direction",
-    "rcon.print('{\"ok\":true,\"x\":'..pos.x..',\"y\":'..pos.y..'}')",
-  ].join(" ");
-}
-
-function directionForVector(dx: number, dy: number) {
-  if (dx === 0 && dy === 0) return 0;
-  const octant = Math.round(Math.atan2(dx, -dy) / (Math.PI / 4));
-  return ((octant % 8) + 8) % 8 * 2;
-}
-
-async function movePlayerTo(targetX: number, targetY: number) {
-  const probe = parseRconJson<any>(
-    await rconCommand(agentPlayerPositionCommand()),
-    "RCON player-position probe returned invalid JSON",
-  );
-  const start = probe?.player;
-  if (!start || !Number.isFinite(start.x) || !Number.isFinite(start.y)) {
-    return { ok: false, error: probe?.error || "probe_failed" };
-  }
-  const distance = Math.hypot(targetX - start.x, targetY - start.y);
-  const steps = Math.max(1, Math.ceil(distance / 0.75));
-  const stepDelayMs = walkDelayMs(distance) / steps;
-  let movedX = start.x;
-  let movedY = start.y;
-  for (let step = 1; step <= steps; step++) {
-    if (stepDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, stepDelayMs));
-    const fraction = step / steps;
-    const nextX = start.x + (targetX - start.x) * fraction;
-    const nextY = start.y + (targetY - start.y) * fraction;
-    const data = parseRconJson<any>(
-      await rconCommand(
-        agentMoveStepCommand({
-          x: nextX,
-          y: nextY,
-          direction: directionForVector(nextX - movedX, nextY - movedY),
-        }),
-      ),
-      "RCON move step returned invalid JSON",
-    );
-    if (!data?.ok) {
-      return {
-        ok: false,
-        error: data?.error || "blocked",
-        movement: { distance, duration_ms: Math.round(walkDelayMs(distance) * (step - 1) / steps), final_position: { x: movedX, y: movedY } },
-      };
-    }
-    movedX = data.x;
-    movedY = data.y;
-  }
-  return {
-    ok: true,
-    movement: { distance, duration_ms: walkDelayMs(distance), final_position: { x: movedX, y: movedY } },
-  };
+async function movePlayerTo(x:number,y:number) {
+  return nativeAction({kind:"move",x,y});
 }
 
 function agentRotateCommand(targets: Array<{ x: number; y: number }>): string {
@@ -1247,7 +794,7 @@ function agentRotateCommand(targets: Array<{ x: number; y: number }>): string {
     "if not e then return {x=x,y=y,ok=false,error='no_entity'} end",
     "local can_reach,reach_err=ensure_reach(e)",
     "if not can_reach then return {x=x,y=y,name=e.name,ok=false,error=reach_err or 'out_of_reach'} end",
-    "local ok,err=pcall(function() e.rotate() end)",
+    "local called,rotated=pcall(function() return e.rotate() end) local ok=called and rotated==true local err=not called and rotated or (not ok and 'rotation_rejected' or nil)",
     "if ok then return {x=x,y=y,name=e.name,ok=true,direction=e.direction} end",
     "return {x=x,y=y,name=e.name,ok=false,error=tostring(err)}",
     "end",
@@ -1301,6 +848,7 @@ function agentSetRecipeCommand(
     "if not e then return {x=x,y=y,ok=false,error='no_entity'} end",
     "local can_reach,reach_err=ensure_reach(e)",
     "if not can_reach then return {x=x,y=y,name=e.name,ok=false,error=reach_err or 'out_of_reach'} end",
+    "local def=player.force.recipes[recipe] if not def or not def.enabled then return {x=x,y=y,name=e.name,ok=false,error='recipe_locked_or_unknown'} end",
     "local ok,err=pcall(function() e.set_recipe(recipe) end)",
     "if ok then return {x=x,y=y,name=e.name,ok=true,recipe=recipe} end",
     "return {x=x,y=y,name=e.name,ok=false,error=tostring(err)}",
@@ -1406,6 +954,7 @@ function agentCraftCommand(recipe: string, count: number): string {
     `local recipe=${luaString(recipe)}`,
     `local count=${count}`,
     "if not player.force.recipes[recipe] then rcon.print('{\"recipe\":'..esc(recipe)..',\"count\":'..esc(count)..',\"ok\":false,\"error\":\"Unknown recipe\"}') return end",
+    "if not player.force.recipes[recipe].enabled then rcon.print(helpers.table_to_json{recipe=recipe,count=count,ok=false,error='recipe_locked'}) return end",
     "local craftable=player.get_craftable_count(recipe)",
     "if craftable < count then",
     "local out={}",
@@ -1417,7 +966,8 @@ function agentCraftCommand(recipe: string, count: number): string {
     "rcon.print('{'..table.concat(out,',')..'}')",
     "return",
     "end",
-    "local ok,err=pcall(function() player.begin_crafting{recipe=recipe,count=count} end)",
+    "local called,queued=pcall(function() return player.begin_crafting{recipe=recipe,count=count} end) local ok=called and queued==count local err=not called and queued or (not ok and 'crafting_rejected' or nil)",
+    "if ok then rcon.print(helpers.table_to_json{recipe=recipe,count=count,queued=queued,ok=true}) return end",
     "local out={}",
     "table.insert(out,'\"recipe\":'..esc(recipe))",
     "table.insert(out,'\"count\":'..esc(count))",
@@ -1679,60 +1229,14 @@ function pushLog(stream: "stdout" | "stderr", chunk: Buffer) {
   }
 }
 
-async function readProcStat(
-  pid: number,
-): Promise<{ procJiffies: number; rssBytes: number }> {
-  const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
-  const parts = stat.trim().split(" ");
-  const utime = Number(parts[13] || 0);
-  const stime = Number(parts[14] || 0);
-  const procJiffies = utime + stime;
-
-  const status = await fs.readFile(`/proc/${pid}/status`, "utf8");
-  const match = status.match(/^VmRSS:\s+(\d+)\s+kB$/m);
-  const rssBytes = match ? Number(match[1]) * 1024 : 0;
-
-  return { procJiffies, rssBytes };
-}
-
-async function readTotalJiffies(): Promise<number> {
-  const stat = await fs.readFile("/proc/stat", "utf8");
-  const line = stat.split("\n")[0] || "";
-  const parts = line.trim().split(/\s+/).slice(1);
-  return parts.reduce((sum, v) => sum + Number(v || 0), 0);
-}
-
 async function sampleUsage() {
   const pid = getRunningPid();
-  if (!pid) {
-    state.usage = { cpuPercent: null, rssBytes: null };
-    state.usagePrev = null;
-    return;
-  }
-
+  if (!pid) { state.usage = { cpuPercent: null, rssBytes: null }; return; }
   try {
-    const [procStat, totalJiffies] = await Promise.all([
-      readProcStat(pid),
-      readTotalJiffies(),
-    ]);
-
-    if (state.usagePrev) {
-      const deltaProc = procStat.procJiffies - state.usagePrev.procJiffies;
-      const deltaTotal = totalJiffies - state.usagePrev.totalJiffies;
-      const cpuPercent = deltaTotal > 0 ? (deltaProc / deltaTotal) * 100 : 0;
-      state.usage = { cpuPercent, rssBytes: procStat.rssBytes };
-    } else {
-      state.usage = { cpuPercent: 0, rssBytes: procStat.rssBytes };
-    }
-
-    state.usagePrev = {
-      procJiffies: procStat.procJiffies,
-      totalJiffies,
-    };
-  } catch {
-    state.usage = { cpuPercent: null, rssBytes: null };
-    state.usagePrev = null;
-  }
+    const { stdout } = await execFileAsync("/bin/ps", ["-p", String(pid), "-o", "%cpu=,rss="], { timeout: 2000 });
+    const [cpu, rss] = stdout.trim().split(/\s+/).map(Number);
+    state.usage = { cpuPercent: Number.isFinite(cpu) ? cpu : null, rssBytes: Number.isFinite(rss) ? rss * 1024 : null };
+  } catch { state.usage = { cpuPercent: null, rssBytes: null }; }
 }
 
 function encodeRconPacket(id: number, type: number, body: string): Buffer {
@@ -1868,14 +1372,6 @@ async function connectRcon(): Promise<boolean> {
       try {
         await rconSendInternal(RCON_AUTH_ID, 3, RCON_PASSWORD, 3000);
         state.rcon.connected = true;
-        if (state.alwaysDayPending) {
-          try {
-            await rconCommand(ALWAYS_DAY_COMMAND);
-            state.alwaysDayPending = false;
-          } catch (err: any) {
-            state.rcon.lastError = err?.message || "Failed to set always_day";
-          }
-        }
         socket.setTimeout(0);
         finish(true);
       } catch (err: any) {
@@ -1895,20 +1391,25 @@ function disconnectRcon() {
   state.rcon.connected = false;
 }
 
+let connectingRcon: Promise<void> | undefined;
 async function ensureRconConnection() {
   if (!rconConfigured()) return;
-  if (!getRunningPid()) {
-    disconnectRcon();
-    return;
-  }
+  if (!getRunningPid()) { disconnectRcon(); return; }
   if (state.rcon.connected) return;
-  await connectRcon();
+  if (!connectingRcon) connectingRcon = connectRcon().then(() => {}).finally(() => { connectingRcon = undefined; });
+  await connectingRcon;
 }
 
 async function rconCommand(command: string, timeoutMs = 3000): Promise<string> {
   if (!state.rcon.connected) throw new Error("RCON not connected");
   const id = state.rcon.nextId++;
   return rconSendInternal(id, 2, command, timeoutMs);
+}
+
+const nativeController=new NativeController(rconCommand);
+function nativeAction(payload:Record<string,unknown>) {
+  const job=currentJob;
+  return nativeController.run(payload,()=>Boolean(job?.cancel_requested) || (runManager.busy && !runManager.acceptingActions));
 }
 
 type JobAction =
@@ -1939,6 +1440,7 @@ type ActionJob = {
 };
 
 const jobs = new Map<string, ActionJob>();
+let currentJob: ActionJob | undefined;
 const jobKeys = new Map<string, string>();
 let actionQueue: Promise<void> = Promise.resolve();
 
@@ -1982,9 +1484,11 @@ async function runActionJob(job: ActionJob) {
   if (job.cancel_requested) {
     job.status = "cancelled";
     job.completed_at = new Date().toISOString();
+    runManager.recordJob("finished", { ...publicJob(job), payload: job.payload });
     return;
   }
   job.status = "running";
+  currentJob = job;
   job.started_at = new Date().toISOString();
   const items = splitJobPayload(job.action, job.payload);
   try {
@@ -1995,7 +1499,7 @@ async function runActionJob(job: ActionJob) {
       }
       const response = await fetch(`http://127.0.0.1:${PORT}${actionPaths[job.action]}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Autorio-Internal": "job" },
+        headers: { "Content-Type": "application/json", "X-Autorio-Internal": INTERNAL_JOB_KEY },
         body: JSON.stringify(payload),
       });
       const envelope = await response.json() as any;
@@ -2007,12 +1511,14 @@ async function runActionJob(job: ActionJob) {
       job.results.push(result);
       job.completed++;
     }
-    if (job.status !== "cancelled") job.status = "completed";
+    job.status = job.cancel_requested ? "cancelled" : "completed";
   } catch (err: any) {
-    job.status = "failed";
+    job.status = job.cancel_requested ? "cancelled" : "failed";
     job.error = err?.message || "Action job failed";
   } finally {
     job.completed_at = new Date().toISOString();
+    runManager.recordJob("finished", { ...publicJob(job), payload: job.payload });
+    currentJob = undefined;
   }
 }
 
@@ -2040,6 +1546,7 @@ function queueActionJob(action: JobAction, payload: any, idempotencyKey: string 
     payload,
   };
   jobs.set(job.id, job);
+  runManager.recordJob("submitted", { ...publicJob(job), payload: job.payload });
   if (scopedKey) jobKeys.set(scopedKey, job.id);
   actionQueue = actionQueue.then(() => runActionJob(job), () => runActionJob(job));
   return job;
@@ -2063,13 +1570,129 @@ setInterval(() => {
   ensureRconConnection().catch(() => {});
 }, RCON_CHECK_MS);
 
+let launchingGame = false;
+async function startGame(savePath: string, profile: string, logFile?: string) {
+  if (launchingGame || getRunningPid()) throw new Error("Game already running or launching");
+  launchingGame = true;
+  try {
+    await factorioVersion();
+    await requireSteam();
+    await prepareProfile(profile);
+    // Refuse to attach to a different game's RCON port.
+    await new Promise<void>((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once("error", () => reject(new Error(`RCON port ${RCON_PORT} is already in use`)));
+      probe.listen(RCON_PORT, RCON_HOST, () => probe.close(() => resolve()));
+    });
+    disconnectRcon();
+    state.logs = []; state.logTail = { stdout: "", stderr: "" };
+    gameLog = logFile ? fsSync.createWriteStream(logFile, { flags: "a" }) : null;
+    const args = [...profileArgs(profile), "--host", savePath,
+      "--server-settings", path.join(profile, "server-settings.json"),
+      "--bind", "127.0.0.1:0", "--rcon-bind", `127.0.0.1:${RCON_PORT}`,
+      "--rcon-password", RCON_PASSWORD, "--window-size", process.env.FACTORIO_WINDOW_SIZE || "1000x760"];
+    if (process.env.FACTORIO_DISABLE_AUDIO === "1") args.push("--disable-audio");
+    const proc = spawn(FACTORIO_BIN, args, { cwd: ROOT, env: factorioEnv, stdio: ["ignore", "pipe", "pipe"] });
+    state.proc = proc; state.procPid = proc.pid ?? null;
+    state.save = path.basename(savePath); state.startedAt = Date.now(); state.lastExit = null;
+    activeSavePath = savePath; activeProfile = profile;
+    state.usage = { cpuPercent: null, rssBytes: null };
+    for (const stream of ["stdout", "stderr"] as const) proc[stream]?.on("data", (chunk: Buffer) => {
+      pushLog(stream, chunk); gameLog?.write(chunk);
+    });
+    proc.once("exit", (code, signal) => {
+      state.lastExit = { code, signal, at: new Date().toISOString() };
+      state.proc = null; state.procPid = null; state.save = null; state.startedAt = null;
+      activeSavePath = null; activeProfile = null;
+      state.usage = { cpuPercent: null, rssBytes: null }; clearPidFile(); disconnectRcon();
+      gameLog?.end(); gameLog = null;
+    });
+    await new Promise<void>((resolve, reject) => { proc.once("spawn", resolve); proc.once("error", reject); });
+    if (proc.pid) writePidFile(proc.pid);
+  } finally { launchingGame = false; }
+}
+
+async function stopGame() {
+  const pid = getRunningPid();
+  if (!pid) return;
+  if(state.rcon.connected)await nativeController.stop().catch(()=>{});
+  process.kill(pid, "SIGTERM");
+  const until = Date.now() + 10_000;
+  while (getRunningPid() && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 100));
+  if (getRunningPid()) {
+    process.kill(pid, "SIGKILL");
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  if (state.procPid === pid && !isPidRunning(pid)) { state.procPid = null; clearPidFile(); }
+}
+
+const runManager = new RunManager({
+  running: () => Boolean(getRunningPid()),
+
+  start: startGame, stop: stopGame, command: rconCommand, connect: ensureRconConnection,
+  cancelJobs: async () => {
+    for (const job of jobs.values()) if (["queued", "running"].includes(job.status)) job.cancel_requested = true;
+    if(state.rcon.connected)await nativeController.stop().catch(()=>{});
+    const drained = await Promise.race([actionQueue.then(() => true), new Promise<false>(resolve => setTimeout(() => resolve(false), 10_000))]);
+    if (!drained) { await stopGame(); await actionQueue; }
+    jobs.clear(); jobKeys.clear();
+  },
+});
+
 async function handleApi(req: IncomingMessage, res: ServerResponse) {
   const url = new URL(
     req.url || "/",
     `http://${req.headers.host || "localhost"}`,
   );
 
+  if (url.pathname === "/api/manager/stop" && req.method === "POST") {
+    json(res, 202, { shutting_down: true });
+    setTimeout(() => { void shutdown("SIGTERM"); }, 100);
+    return;
+  }
+
+  if (url.pathname === "/api/obs/status" && req.method === "GET") return json(res,200,await obsStatus());
+  if (url.pathname === "/api/benchmarks" && req.method === "GET") return json(res, 200, { benchmarks: runManager.benchmarks });
+  if (url.pathname === "/api/runs" && req.method === "GET") return json(res, 200, { runs: runManager.list() });
+  if (url.pathname === "/api/runs" && req.method === "POST") {
+    try { return json(res, 202, runManager.start(await readJson(req))); }
+    catch (error: any) { return json(res, 400, { error: error.message }); }
+  }
+  const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)(?:\/(stop|resume|log|video))?$/);
+  if (runMatch) {
+    const run = runManager.get(runMatch[1]);
+    if (!run) return json(res, 404, { error: "Run not found" });
+    if (!runMatch[2] && req.method === "GET") return json(res, 200, run);
+    if(runMatch[2] === "video" && req.method === "GET") {
+      const file=runManager.videoFile(run.id,url.searchParams.has("segment")?Number(url.searchParams.get("segment")):undefined);
+      if(!file || !fsSync.existsSync(file))return json(res,404,{error:"Timelapse is not ready"});
+      const size=fsSync.statSync(file).size,range=req.headers.range;
+      const match=range?.match(/^bytes=(\d+)-(\d*)$/);
+      if(range && !match){res.writeHead(416,{"Content-Range":`bytes */${size}`});return res.end();}
+      const start=match?Number(match[1]):0,end=match && match[2]?Math.min(Number(match[2]),size-1):size-1;
+      if(start>=size || end<start){res.writeHead(416,{"Content-Range":`bytes */${size}`});return res.end();}
+      res.writeHead(match?206:200,{"Content-Type":"video/mp4","Accept-Ranges":"bytes","Content-Length":end-start+1,...(match?{"Content-Range":`bytes ${start}-${end}/${size}`}:{})});
+      const stream=fsSync.createReadStream(file,{start,end});stream.on("error",()=>res.destroy());res.on("close",()=>stream.destroy());return stream.pipe(res);
+    }
+    if (runMatch[2] === "log" && req.method === "GET") {
+      const offset = Number(url.searchParams.get("offset") || 0);
+      return json(res, 200, runManager.log(run.id, Number.isFinite(offset) ? Math.floor(offset) : 0, url.searchParams.get("source") === "telemetry" ? "telemetry" : url.searchParams.get("source") === "events" ? "events" : url.searchParams.get("source") === "codex"));
+    }
+    if(runMatch[2]==="resume" && req.method==="POST") {
+      try{return json(res,202,runManager.resume(run.id));}
+      catch(error:any){return json(res,409,{error:error.message});}
+    }
+    if (runMatch[2] === "stop" && req.method === "POST") {
+      if (["preparing", "launching", "running", "saving"].includes(run.state)) {
+        try { await runManager.stop(); }
+        catch (error: any) { return json(res, 409, { error: error.message }); }
+      }
+      return json(res, 200, runManager.get(run.id));
+    }
+  }
+
   if (req.method === "POST" && url.pathname === "/api/agent/jobs") {
+    if (runManager.busy && !runManager.acceptingActions) return json(res, 409, { error: "Run is not accepting actions" });
     let body: any = null;
     try {
       body = await readJson(req);
@@ -2104,16 +1727,21 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     const job = jobs.get(cancelJobMatch[1]);
     if (!job) return json(res, 404, { error: "Job not found" });
     if (job.status === "queued" || job.status === "running") job.cancel_requested = true;
+    if(job===currentJob && state.rcon.connected)await nativeController.stop().catch(()=>{});
     return json(res, 202, publicJob(job));
   }
 
   if (
     url.pathname.startsWith("/api/agent/act/") &&
-    req.headers["x-autorio-internal"] !== "job"
+    req.headers["x-autorio-internal"] !== INTERNAL_JOB_KEY
   ) {
     return json(res, 409, {
       error: "Actions must be submitted through POST /api/agent/jobs",
     });
+  }
+
+  if(url.pathname.startsWith("/api/agent/act/") && (currentJob?.cancel_requested || (runManager.busy && !runManager.acceptingActions))) {
+    return json(res,409,{error:"cancelled"});
   }
 
   if (req.method === "GET" && url.pathname === "/api/saves") {
@@ -2460,94 +2088,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     try {
       const results: any[] = [];
       for (const target of trimmed) {
-        const probeResponse = await rconCommand(
-          agentMineProbeCommand({
-            x: Number(target.x),
-            y: Number(target.y),
-            kind: target.kind,
-            name: target.name,
-          }),
-        );
-        const probe = parseRconJson<any>(
-          probeResponse,
-          "RCON probe returned invalid JSON",
-        );
-        if (probe?.error) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: probe.error,
-          });
-          continue;
-        }
-        const playerPos = probe?.player;
-        const entityPos = probe?.entity;
-        if (
-          !playerPos ||
-          !entityPos ||
-          !Number.isFinite(playerPos.x) ||
-          !Number.isFinite(playerPos.y) ||
-          !Number.isFinite(entityPos.x) ||
-          !Number.isFinite(entityPos.y)
-        ) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: "probe_failed",
-          });
-          continue;
-        }
-        const movement = await moveNearEntity({
-          x: Number(target.x),
-          y: Number(target.y),
-          kind: target.kind,
-          name: target.name,
-        });
-        if (!movement?.ok) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: movement?.error || "movement_failed",
-            movement: movement?.movement,
-          });
-          continue;
-        }
-        const response = await rconCommand(
-          agentMineCommand([{
-            x: Number(target.x),
-            y: Number(target.y),
-            kind: target.kind,
-            name: target.name,
-          }]),
-        );
-        const data = parseRconJson<any>(
-          response,
-          "RCON mine returned invalid JSON",
-        );
-        const entry = data?.results?.[0];
-        if (!entry) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: "mine_failed",
-          });
-        } else {
-          results.push({ ...entry, movement: movement.movement });
-          if (entry?.ok) {
-            const minedCountRaw = Number(entry?.mined_count);
-            const minedCount = Number.isFinite(minedCountRaw)
-              ? Math.max(1, Math.ceil(minedCountRaw))
-              : 1;
-            const postDelayMs = minedCount * 2000;
-            if (postDelayMs > 0) {
-              await new Promise((resolve) => setTimeout(resolve, postDelayMs));
-            }
-          }
-        }
+        const result=await nativeAction({kind:"mine",target:{x:Number(target.x),y:Number(target.y),kind:target.kind,name:target.name}});
+        results.push({...result,x:Number(target.x),y:Number(target.y)});
       }
       return json(res, 200, {
         ok: true,
@@ -2581,72 +2123,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     try {
       const results: any[] = [];
       for (const target of trimmed) {
-        const probeResponse = await rconCommand(agentPlayerPositionCommand());
-        const probe = parseRconJson<any>(
-          probeResponse,
-          "RCON probe returned invalid JSON",
-        );
-        if (probe?.error) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: probe.error,
-          });
-          continue;
-        }
-        const playerPos = probe?.player;
-        if (
-          !playerPos ||
-          !Number.isFinite(playerPos.x) ||
-          !Number.isFinite(playerPos.y)
-        ) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: "probe_failed",
-          });
-          continue;
-        }
-        const targetX = Number(target.x) + 0.5;
-        const targetY = Number(target.y) + 0.5;
-        const distance = Math.hypot(targetX - playerPos.x, targetY - playerPos.y);
-        const steps = Math.max(1, Math.ceil(distance / 0.75));
-        const stepDelayMs = walkDelayMs(distance) / steps;
-        let movedX = playerPos.x;
-        let movedY = playerPos.y;
-        let error: string | null = null;
-        for (let step = 1; step <= steps; step++) {
-          if (stepDelayMs > 0) {
-            await new Promise((resolve) => setTimeout(resolve, stepDelayMs));
-          }
-          const fraction = step / steps;
-          const nextX = playerPos.x + (targetX - playerPos.x) * fraction;
-          const nextY = playerPos.y + (targetY - playerPos.y) * fraction;
-          const response = await rconCommand(
-            agentMoveStepCommand({
-              x: nextX,
-              y: nextY,
-              direction: directionForVector(nextX - movedX, nextY - movedY),
-            }),
-          );
-          const data = parseRconJson<any>(response, "RCON move step returned invalid JSON");
-          if (!data?.ok) {
-            error = data?.error || "blocked";
-            break;
-          }
-          movedX = data.x;
-          movedY = data.y;
-        }
-        results.push({
-          x: Number(target.x),
-          y: Number(target.y),
-          ok: !error,
-          moved_x: movedX,
-          moved_y: movedY,
-          ...(error ? { error } : {}),
-        });
+        const result=await movePlayerTo(Number(target.x)+0.5,Number(target.y)+0.5);
+        results.push({...result,x:Number(target.x),y:Number(target.y),moved_x:result.movement?.final_position?.x,moved_y:result.movement?.final_position?.y});
       }
       return json(res, 200, {
         ok: true,
@@ -2680,40 +2158,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     try {
       const results: any[] = [];
       for (const target of trimmed) {
-        const probeResponse = await rconCommand(
-          agentEntityProbeCommand({ x: Number(target.x), y: Number(target.y) }),
-        );
-        const probe = parseRconJson<any>(
-          probeResponse,
-          "RCON probe returned invalid JSON",
-        );
-        if (probe?.error) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: probe.error,
-          });
-          continue;
-        }
-        const playerPos = probe?.player;
-        const entityPos = probe?.entity;
-        if (
-          !playerPos ||
-          !entityPos ||
-          !Number.isFinite(playerPos.x) ||
-          !Number.isFinite(playerPos.y) ||
-          !Number.isFinite(entityPos.x) ||
-          !Number.isFinite(entityPos.y)
-        ) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: "probe_failed",
-          });
-          continue;
-        }
         const movement = await moveNearEntity({
           x: Number(target.x),
           y: Number(target.y),
@@ -2779,40 +2223,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     try {
       const results: any[] = [];
       for (const target of trimmed) {
-        const probeResponse = await rconCommand(
-          agentEntityProbeCommand({ x: Number(target.x), y: Number(target.y) }),
-        );
-        const probe = parseRconJson<any>(
-          probeResponse,
-          "RCON probe returned invalid JSON",
-        );
-        if (probe?.error) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: probe.error,
-          });
-          continue;
-        }
-        const playerPos = probe?.player;
-        const entityPos = probe?.entity;
-        if (
-          !playerPos ||
-          !entityPos ||
-          !Number.isFinite(playerPos.x) ||
-          !Number.isFinite(playerPos.y) ||
-          !Number.isFinite(entityPos.x) ||
-          !Number.isFinite(entityPos.y)
-        ) {
-          results.push({
-            x: Number(target.x),
-            y: Number(target.y),
-            ok: false,
-            error: "probe_failed",
-          });
-          continue;
-        }
         const movement = await moveNearEntity({
           x: Number(target.x),
           y: Number(target.y),
@@ -2919,34 +2329,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       return json(res, 400, { error: "Missing target" });
     }
     try {
-      const probeResponse = await rconCommand(
-        agentEntityProbeCommand({ x: Number(to.x), y: Number(to.y) }),
-      );
-      const probe = parseRconJson<any>(
-        probeResponse,
-        "RCON probe returned invalid JSON",
-      );
-      if (probe?.error) {
-        return json(res, 200, {
-          ok: true,
-          data: { ok: false, error: probe.error },
-        });
-      }
-      const playerPos = probe?.player;
-      const entityPos = probe?.entity;
-      if (
-        !playerPos ||
-        !entityPos ||
-        !Number.isFinite(playerPos.x) ||
-        !Number.isFinite(playerPos.y) ||
-        !Number.isFinite(entityPos.x) ||
-        !Number.isFinite(entityPos.y)
-      ) {
-        return json(res, 200, {
-          ok: true,
-          data: { ok: false, error: "probe_failed" },
-        });
-      }
       const movement = await moveNearEntity({ x: Number(to.x), y: Number(to.y) });
       if (!movement?.ok) {
         return json(res, 200, {
@@ -2994,34 +2376,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       return json(res, 400, { error: "Missing target" });
     }
     try {
-      const probeResponse = await rconCommand(
-        agentEntityProbeCommand({ x: Number(from.x), y: Number(from.y) }),
-      );
-      const probe = parseRconJson<any>(
-        probeResponse,
-        "RCON probe returned invalid JSON",
-      );
-      if (probe?.error) {
-        return json(res, 200, {
-          ok: true,
-          data: { ok: false, error: probe.error },
-        });
-      }
-      const playerPos = probe?.player;
-      const entityPos = probe?.entity;
-      if (
-        !playerPos ||
-        !entityPos ||
-        !Number.isFinite(playerPos.x) ||
-        !Number.isFinite(playerPos.y) ||
-        !Number.isFinite(entityPos.x) ||
-        !Number.isFinite(entityPos.y)
-      ) {
-        return json(res, 200, {
-          ok: true,
-          data: { ok: false, error: "probe_failed" },
-        });
-      }
       const movement = await moveNearEntity({ x: Number(from.x), y: Number(from.y) });
       if (!movement?.ok) {
         return json(res, 200, {
@@ -3270,6 +2624,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/server/save") {
+    if (runManager.busy) return json(res, 409, { error: "The run manager saves the game when the run ends" });
     if (!getRunningPid()) {
       return json(res, 409, { error: "Server not running" });
     }
@@ -3280,7 +2635,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       return json(res, 409, { error: "RCON not connected" });
     }
     try {
-      const response = await rconCommand("/save", 30_000);
+      if (!activeSavePath || !activeProfile) throw new Error("This game was recovered after a restart; stop it and reload a save before saving through the API");
+      const saveName = `autorio-checkpoint-${randomUUID()}`;
+      const checkpoint = path.join(activeProfile, "saves", `${saveName}.zip`);
+      const response = await rconCommand(`/save ${saveName}`, 30_000);
+      const until = Date.now() + 30_000;
+      while (!fsSync.existsSync(checkpoint) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 200));
+      if (!fsSync.existsSync(checkpoint)) throw new Error("Checkpoint was not written");
+      await fs.copyFile(checkpoint, activeSavePath);
       return json(res, 200, { ok: true, save: state.save, response });
     } catch (err: any) {
       return json(res, 500, { error: err?.message || "Failed to save game" });
@@ -3300,7 +2662,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
     }
 
     const save = body?.save;
-    if (!save || typeof save !== "string") {
+    if (!save || typeof save !== "string" || path.basename(save) !== save) {
       return json(res, 400, { error: "Missing save" });
     }
 
@@ -3318,109 +2680,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
       return json(res, 400, { error: "Save not found" });
     }
 
-    const settingsPath = path.join(
-      FACTORIO_DIR,
-      "config",
-      "server-settings.json",
-    );
-    const adminlistPath = path.join(
-      FACTORIO_DIR,
-      "config",
-      "server-adminlist.json",
-    );
-    const args = [
-      "--start-server",
-      savePath,
-      "--server-settings",
-      settingsPath,
-      "--server-adminlist",
-      adminlistPath,
-      // Uncomment this and comment --start-server to load the default lab scenario
-      // "--start-server-load-scenario",
-      // "default_lab_scenario",
-    ];
-    if (rconConfigured()) {
-      args.push(
-        "--rcon-port",
-        String(RCON_PORT),
-        "--rcon-password",
-        RCON_PASSWORD,
-      );
-    }
-
-    const proc = spawn(FACTORIO_BIN, args, {
-      cwd: ROOT,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-    });
-    proc.unref();
-
-    proc.stdout?.on("data", (chunk) => {
-      process.stdout.write(`[factorio] ${chunk}`);
-      pushLog("stdout", chunk);
-    });
-    proc.stderr?.on("data", (chunk) => {
-      process.stderr.write(`[factorio] ${chunk}`);
-      pushLog("stderr", chunk);
-    });
-
-    proc.on("exit", (code, signal) => {
-      state.lastExit = {
-        code,
-        signal: signal as NodeJS.Signals | null,
-        at: new Date().toISOString(),
-      };
-      state.proc = null;
-      state.procPid = null;
-      clearPidFile();
-      state.save = null;
-      state.startedAt = null;
-      state.usage = { cpuPercent: null, rssBytes: null };
-      state.usagePrev = null;
-      disconnectRcon();
-    });
-
-    state.proc = proc;
-    state.procPid = proc.pid ?? null;
-    state.save = save;
-    state.startedAt = Date.now();
-    state.logs = [];
-    state.logTail = { stdout: "", stderr: "" };
-    state.usage = { cpuPercent: 0, rssBytes: null };
-    state.usagePrev = null;
-    state.rcon.lastError = null;
-    state.alwaysDayPending = rconConfigured();
-    if (state.procPid) {
-      writePidFile(state.procPid);
-    }
-
-    if (state.alwaysDayPending && state.rcon.connected) {
-      try {
-        await rconCommand(ALWAYS_DAY_COMMAND);
-        state.alwaysDayPending = false;
-      } catch (err: any) {
-        state.rcon.lastError = err?.message || "Failed to set always_day";
-      }
-    }
+    if (runManager.busy) return json(res, 409, { error: "A benchmark run owns the game" });
+    try {
+      await startGame(savePath, MANAGER_PROFILE);
+    } catch (error: any) { return json(res, 500, { error: error.message }); }
 
     return json(res, 200, statusPayload());
   }
 
   if (req.method === "POST" && url.pathname === "/api/server/stop") {
-    const pid = getRunningPid();
-    if (!pid) {
-      return json(res, 409, { error: "Server not running" });
-    }
-
-    try {
-      if (state.proc && !state.proc.killed) {
-        state.proc.kill("SIGTERM");
-      } else {
-        process.kill(pid, "SIGTERM");
-      }
-    } catch (err: any) {
-      return json(res, 500, { error: err?.message || "Failed to stop server" });
-    }
+    if (runManager.busy) return json(res, 409, { error: "Stop the benchmark run through /api/runs/:id/stop" });
+    if (!getRunningPid()) return json(res, 409, { error: "Game not running" });
+    try { await stopGame(); }
+    catch (error: any) { return json(res, 500, { error: error.message }); }
     return json(res, 200, { ok: true });
   }
 
@@ -3441,6 +2713,12 @@ async function handleStatic(req: IncomingMessage, res: ServerResponse) {
     `http://${req.headers.host || "localhost"}`,
   );
   let pathname = url.pathname;
+  if (pathname === "/runs.html") {
+    const id = url.searchParams.get("run");
+    const target = url.searchParams.get("recording") === "1" ? "/recording.html" : id ? "/run.html" : "/";
+    res.writeHead(302, { Location: target + (id ? `?run=${encodeURIComponent(id)}` : "") });
+    return res.end();
+  }
   if (pathname === "/") pathname = "/index.html";
   const relPath = pathname.replace(/^\/+/, "");
   const publicRoot = path.join(ROOT, "public");
@@ -3467,27 +2745,30 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.url.startsWith("/api/")) {
-    return handleApi(req, res);
+    try { return await handleApi(req, res); }
+    catch (error: any) { return json(res, 500, { error: error.message || "Request failed" }); }
   }
 
   return handleStatic(req, res);
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, "127.0.0.1", () => {
   console.log(`Server listening on http://localhost:${PORT}`);
 });
 
 let shuttingDown = false;
 
-function shutdown(signal: NodeJS.Signals) {
+async function shutdown(signal: NodeJS.Signals) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`Shutting down (${signal})...`);
-  server.close(() => {
-    process.exit(0);
-  });
-  setTimeout(() => process.exit(0), 3000);
+  try {
+    await runManager.shutdown();
+    if (getRunningPid()) await stopGame();
+  } catch (error) { console.error(error); }
+  server.close(() => process.exit(0));
+  server.closeAllConnections();
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => { void shutdown("SIGINT"); });
+process.on("SIGTERM", () => { void shutdown("SIGTERM"); });

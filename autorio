@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""macOS entry point: find Node, build if needed, and invoke the run CLI."""
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parent
+os.chdir(root)
+candidates = [os.environ.get("NODE_BIN"), shutil.which("node"), "/opt/homebrew/bin/node", "/usr/local/bin/node",
+              str(Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node")]
+node = next((p for p in candidates if p and Path(p).is_file()), None)
+if not node:
+    sys.exit("Install Node.js 22+ or set NODE_BIN to its executable path.")
+os.environ["PATH"] = str(Path(node).parent) + os.pathsep + os.environ.get("PATH", "")
+compiler = root / "node_modules/typescript/bin/tsc"
+if not compiler.exists():
+    sys.exit("Install development dependencies with npm ci, then run ./autorio again.")
+entry = root / "dist/run-cli.js"
+sources = list((root / "src").glob("*.ts")) + [root / "tsconfig.json"]
+if not entry.exists() or any(p.stat().st_mtime > entry.stat().st_mtime for p in sources):
+    result = subprocess.run([node, str(compiler)], cwd=root)
+    if result.returncode:
+        sys.exit(result.returncode)
+os.execv(node, [node, str(entry)] + sys.argv[1:])

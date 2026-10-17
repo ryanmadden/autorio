@@ -1,0 +1,19 @@
+{
+  "id": "automation",
+  "title": "Automate iron production",
+  "task": "Build a working iron smelting setup and produce at least 20 new iron plates. Use mining drills to supply ore and fuel your furnace. Verify the setup actually produces plates. Keep working until at least 20 plates have been produced; initial inventory does not count.",
+  "map_gen": {
+    "seed": 424242,
+    "peaceful_mode": true,
+    "autoplace_controls": { "enemy-base": { "frequency": 0, "size": 0 } }
+  },
+  "always_day": true,
+  "starting_items": { "iron-plate": 8, "burner-mining-drill": 1, "stone-furnace": 1 },
+  "max_seconds": 3600,
+  "sample_seconds": 5,
+  "milestones": [
+    { "id": "first-plate", "kind": "production", "name": "iron-plate", "count": 1 },
+    { "id": "twenty-plates", "kind": "production", "name": "iron-plate", "count": 20 }
+  ],
+  "completion": "twenty-plates"
+}

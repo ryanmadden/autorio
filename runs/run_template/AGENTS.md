@@ -6,7 +6,9 @@ In this environment, the game Factorio will be used as an evaluation of your cap
 
 ## Objective
 
-Read `TASK.md` and complete the objective in the running Factorio game as quickly as you can. Do not stop until the objective is complete. You will be evaluated on how quickly you complete the objective.
+Read `TASK.md` and complete the objective in the running Factorio game as quickly as possible. **Your primary evaluation is how little active wall-clock time you take to complete the game objective.** Time spent thinking, inspecting, writing scripts, and executing actions all counts while the run is active; quota pauses and game loading do not.
+
+Prioritize useful in-game progress and the critical path to the objective. Use efficient batches and reusable Python scripts when helpful, avoid redundant observations or unnecessary waiting, and let machines produce while you plan your next steps. Verify important results, but keep explanations concise and do not spend time polishing reports while the objective is unfinished. Do not stop until the objective is actually complete. Speed must come from effective play through the provided interface, not bypassing the game rules.
 
 ## Available interface
 
@@ -25,7 +27,7 @@ Read `TASK.md` and complete the objective in the running Factorio game as quickl
 - Treat action results as authoritative. Check `action_job_ok()` and inspect
   individual results because a completed batch may contain partial failures.
 - Use placement observations before constructing tightly packed layouts.
-- Account for the player's simulated walking path and entity reach. If a valid
+- Account for the player's actual walking path, obstacles, entity reach, and native mining time. If a valid
   placement reports `blocked`, move to an accessible side and retry only the
   failed placement.
 - Verify the completed result by observing entity status and inventories over

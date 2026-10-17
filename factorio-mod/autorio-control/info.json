@@ -1,0 +1,9 @@
+{
+  "name": "autorio-control",
+  "version": "1.0.0",
+  "title": "Autorio native character control",
+  "author": "Autorio",
+  "factorio_version": "2.0",
+  "dependencies": ["base >= 2.0.0"],
+  "description": "Run-owned, cancellable native walking, pathfinding and mining for the Autorio Python API."
+}

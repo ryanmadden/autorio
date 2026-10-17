@@ -7,10 +7,8 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "agent": "node dist/agent-cli.js"
-  },
-  "bin": {
-    "factorio": "dist/agent-cli.js"
+    "run": "node dist/run-cli.js",
+    "test": "npm run build && node --test tests/*.test.mjs && python3 -m unittest discover -s tests -v"
   },
   "dependencies": {},
   "devDependencies": {
