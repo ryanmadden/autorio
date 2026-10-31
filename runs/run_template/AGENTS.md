@@ -17,6 +17,11 @@ Prioritize useful in-game progress and the critical path to the objective. Use e
 - The default manager address is `http://localhost:3000`.
 - If provided, `FACTORIO_API_BASE` overrides the manager address.
 - Use `python3 factorio.py --help` and command-specific help when needed.
+- For rocket objectives, inspect a silo with `observe_entity`, then call
+  `launch_rocket([{"x": x, "y": y}])` (CLI: `act-launch-rocket --target x,y`).
+  The silo's `rocket` observation includes parts, required parts, `silo_status`,
+  `ready`, and the force's recorded `rockets_launched`. A successful action
+  initiates launch; keep working until the game records the actual launch.
 
 ## Operating rules
 

@@ -55,6 +55,7 @@ Commands:
   act-mine --target x,y [--target ...] [--resource [name]] [--targets-json <json>]
   act-rotate --target x,y [--target ...] [--targets-json <json>]
   act-move --target x,y [--target ...] [--targets-json <json>]
+  act-launch-rocket --target x,y [--target ...] [--targets-json <json>]
   act-set-recipe --target x,y,recipe [--target ...] [--targets-json <json>]
   act-research --technology <name>
   act-craft --item <name> --count <n>
@@ -66,7 +67,7 @@ Commands:
 
 Notes:
   - Agents use this API without GUI input; the local Factorio game runs with graphics.
-  - Actions that require the player to be near a target (build/mine/rotate/insert/extract/set-recipe)
+  - Actions that require the player to be near a target (build/mine/rotate/insert/extract/set-recipe/launch-rocket)
     are NOT instant. The character walks through the game world, respecting obstacles and reach. Mining uses native mining cycles.
 
 Global options:
@@ -98,6 +99,7 @@ COMMAND_USAGE = {
     "act-mine": "act-mine: Mine a resource or entity at target tile coordinates.\nUsage: factorio.py act-mine --target x,y [--target ...] [--resource [name]]\n   or: factorio.py act-mine --targets-json <json>\nResource mode excludes the character and prioritizes the requested resource deterministically.\nNote: The character walks into reach and performs one native mining cycle per target (one extraction for a resource vein).\n",
     "act-rotate": "act-rotate: Rotate entities at target tile coordinates (first entity at each point).\nUsage: factorio.py act-rotate --target x,y [--target ...]\n   or: factorio.py act-rotate --targets-json <json>\nDirection (in results): 0=north (up), 4=east (right), 8=south (down), 12=west (left).\nNote: The character walks into reach using native pathfinding.\n",
     "act-move": "act-move: Move the player through paced, collision-checked steps to target tile coordinates.\nUsage: factorio.py act-move --target x,y [--target ...]\n   or: factorio.py act-move --targets-json <json>\nNote: Stops and returns partial progress if an intermediate step is blocked.\n",
+    "act-launch-rocket": "act-launch-rocket: Launch a ready rocket silo at target tile coordinates.\nUsage: factorio.py act-launch-rocket --target x,y [--target ...]\n   or: factorio.py act-launch-rocket --targets-json <json>\nNote: Walks into reach. Success means launch initiated; the benchmark waits for an actual launch.\n",
     "act-set-recipe": "act-set-recipe: Set the recipe on assemblers at target tile coordinates.\nUsage: factorio.py act-set-recipe --target x,y,recipe [--target ...]\n   or: factorio.py act-set-recipe --targets-json <json>\nNote: The character walks into reach using native pathfinding.\n",
     "act-research": "act-research: Start researching a technology.\nUsage: factorio.py act-research --technology <name>\n",
     "act-craft": "act-craft: Start crafting a recipe in the player's crafting queue.\nUsage: factorio.py act-craft --item <name> --count <n>\n",
@@ -374,6 +376,10 @@ class FactorioClient:
     def move(self, targets: list[dict[str, Any]], **options: Any) -> Any:
         return self.submit_action("move", {"targets": targets}, **options)
 
+    def launch_rocket(self, targets: list[dict[str, Any]], **options: Any) -> Any:
+        """Launch ready silos; success indicates launch initiation, not flight completion."""
+        return self.submit_action("launch-rocket", {"targets": targets}, **options)
+
     def set_recipe(self, targets: list[dict[str, Any]], **options: Any) -> Any:
         return self.submit_action("set-recipe", {"targets": targets}, **options)
 
@@ -567,13 +573,13 @@ def run(argv: list[str]) -> int:
         if cmd == "act-build":
             entities = json.loads(flag("entities-json")) if flag("entities-json") else parse_entities(flags.get("entity", []))
             job = submit("build", {"entities": entities})
-        elif cmd in ("act-mine", "act-rotate", "act-move", "act-set-recipe"):
+        elif cmd in ("act-mine", "act-rotate", "act-move", "act-set-recipe", "act-launch-rocket"):
             require_recipe = cmd == "act-set-recipe"
             targets = json.loads(flag("targets-json")) if flag("targets-json") else parse_targets(flags.get("target", []), require_recipe)
             if cmd == "act-mine" and flag("resource"):
                 resource = flag("resource")
                 targets = [dict(target, kind="resource", **({} if resource == "true" else {"name": resource})) for target in targets]
-            action = {"act-mine": "mine", "act-rotate": "rotate", "act-move": "move", "act-set-recipe": "set-recipe"}[cmd]
+            action = {"act-mine": "mine", "act-rotate": "rotate", "act-move": "move", "act-set-recipe": "set-recipe", "act-launch-rocket": "launch-rocket"}[cmd]
             job = submit(action, {"targets": targets})
         elif cmd == "act-research":
             technology = flag("technology")

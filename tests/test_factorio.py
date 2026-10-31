@@ -40,6 +40,23 @@ class ParsingTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_rocket_launch_submits_targets_and_job_options(self):
+        client = factorio.FactorioClient()
+        targets = [{"x": 10, "y": -12}, {"x": 30, "y": 20}]
+        with patch.object(client, "submit_action", return_value={"job_id": "launch"}) as submit:
+            client.launch_rocket(targets, detach=True, idempotency_key="launch-1")
+        submit.assert_called_once_with("launch-rocket", {"targets": targets}, detach=True, idempotency_key="launch-1")
+
+    def test_rocket_launch_cli_batches_targets_and_reports_rejection(self):
+        for result_ok in [True, False]:
+            stdout = io.StringIO()
+            job = {"status": "completed", "results": [{"ok": result_ok}]}
+            with patch("factorio.submit_action_job", return_value=job) as submit, redirect_stdout(stdout):
+                code = factorio.run(["act-launch-rocket", "--target", "10,-12", "--target", "30,20", "--idempotency-key", "launch-1"])
+            self.assertEqual(code, 0 if result_ok else 1)
+            self.assertEqual(json.loads(stdout.getvalue())["ok"], result_ok)
+            submit.assert_called_once_with(factorio.DEFAULT_BASE, "launch-rocket", {"targets": [{"x": 10, "y": -12}, {"x": 30, "y": 20}]}, detach=False, idempotency_key="launch-1")
+
     def test_observation_route_and_none_compaction(self):
         client = factorio.FactorioClient("http://example.invalid/")
         with patch("factorio.http_request", return_value={"ok": True}) as request:

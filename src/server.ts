@@ -13,6 +13,7 @@ import {
   profileArgs, createMap, factorioVersion, requireSteam, execFileAsync,
 } from "./runtime.js";
 import {NativeController} from "./native-control.js";
+import { launchRocket, ROCKET_STATE_LUA } from "./rocket.js";
 import { RunManager } from "./runs.js";
 
 fsSync.mkdirSync(DATA_DIR, { recursive: true });
@@ -1101,6 +1102,7 @@ function agentObserveEntityCommand(
 ): string {
   const parts = [
     "/sc", "local s=game.surfaces[1]", "local force=game.forces.player or game.forces[1]", "local results={}",
+    ROCKET_STATE_LUA,
     "local function find_entity(x,y,kind,wanted_name) local ents=s.find_entities_filtered{area={{x,y},{x+1,y+1}}} or {} local candidates={} for _,cand in pairs(ents) do if cand and cand.valid and cand.type~='character' and cand.type~='item-entity' and cand.type~='corpse' and (not kind or (kind=='resource' and cand.type=='resource') or (kind=='entity' and cand.type~='resource')) and (not wanted_name or cand.name==wanted_name) then local dx=cand.position.x-(x+0.5) local dy=cand.position.y-(y+0.5) local score=(cand.type=='resource' and 0 or 100)+(wanted_name and 1000 or 0)-dx*dx-dy*dy table.insert(candidates,{entity=cand,score=score,key=cand.name..':'..cand.position.x..':'..cand.position.y}) end end table.sort(candidates,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end) return candidates[1] and candidates[1].entity or nil end",
     "local function items(inv) local out={} if inv and inv.valid then for i=1,#inv do local stack=inv[i] if stack and stack.valid_for_read then table.insert(out,{slot=i,name=stack.name,count=stack.count}) end end end return out end",
     "local function observe(x,y,kind,wanted_name)",
@@ -1113,7 +1115,7 @@ function agentObserveEntityCommand(
     "local max_index=0 pcall(function() local value=e.get_max_inventory_index() if type(value)=='number' then max_index=value end end) for index=1,max_index do local got=nil pcall(function() got=e.get_inventory(index) end) if got and got.valid then local n=nil pcall(function() n=e.get_inventory_name(index) end) add_inventory(n or 'inventory',got,index) end end",
     "local fluid_boxes={} local fb_count=0 pcall(function() fb_count=#e.fluidbox end) for index=1,fb_count do local fluid=nil pcall(function() fluid=e.fluidbox[index] end) local capacity=nil pcall(function() capacity=e.fluidbox.get_capacity(index) end) local filter=nil pcall(function() local f=e.fluidbox.get_filter(index) filter=f and f.name or nil end) local production_type=nil pcall(function() local fp=e.fluidbox.get_prototype(index) if fp and fp.production_type then production_type=fp.production_type end end) local connections={} pcall(function() for _,c in pairs(e.fluidbox.get_pipe_connections(index) or {}) do local owner=c.target and c.target.owner or nil table.insert(connections,{connection_type=c.connection_type,flow_direction=c.flow_direction,position={x=c.position.x,y=c.position.y},target_position={x=c.target_position.x,y=c.target_position.y},target=owner and {name=owner.name,center={x=owner.position.x,y=owner.position.y}} or nil,target_fluidbox_index=c.target_fluidbox_index,target_pipe_connection_index=c.target_pipe_connection_index}) end end) table.insert(fluid_boxes,{index=index,production_type=production_type,filter=filter,capacity=capacity,fluid=fluid and {name=fluid.name,amount=fluid.amount,temperature=fluid.temperature} or nil,connections=connections}) end",
     "local recipe=nil pcall(function() local r=e.get_recipe() recipe=r and r.name or nil end) local drop_position=nil pcall(function() drop_position=e.drop_position end) local drop_target=nil pcall(function() local t=e.drop_target drop_target=t and {name=t.name,center={x=t.position.x,y=t.position.y}} or nil end)",
-    "return {requested_tile={x=x,y=y},ok=true,name=e.name,type=e.type,center={x=e.position.x,y=e.position.y},occupied_tile={x=math.floor(e.position.x),y=math.floor(e.position.y)},direction=e.direction,status=status,health=health,max_health=max_health,energy=energy,recipe=recipe,inventories=inventories,fluid_boxes=fluid_boxes,drop_position=drop_position and {x=drop_position.x,y=drop_position.y} or nil,drop_target=drop_target} end",
+    "return {requested_tile={x=x,y=y},ok=true,name=e.name,type=e.type,center={x=e.position.x,y=e.position.y},occupied_tile={x=math.floor(e.position.x),y=math.floor(e.position.y)},direction=e.direction,status=status,rocket=rocket_state(e),health=health,max_health=max_health,energy=energy,recipe=recipe,inventories=inventories,fluid_boxes=fluid_boxes,drop_position=drop_position and {x=drop_position.x,y=drop_position.y} or nil,drop_target=drop_target} end",
   ];
   for (const target of targets) {
     parts.push(`table.insert(results,observe(${target.x},${target.y},${target.kind ? luaString(target.kind) : "nil"},${target.name ? luaString(target.name) : "nil"}))`);
@@ -1418,6 +1420,7 @@ type JobAction =
   | "move"
   | "rotate"
   | "set-recipe"
+  | "launch-rocket"
   | "research"
   | "craft"
   | "insert"
@@ -1450,6 +1453,7 @@ const actionPaths: Record<JobAction, string> = {
   move: "/api/agent/act/move",
   rotate: "/api/agent/act/rotate",
   "set-recipe": "/api/agent/act/set-recipe",
+  "launch-rocket": "/api/agent/act/launch-rocket",
   research: "/api/agent/act/research",
   craft: "/api/agent/act/craft",
   insert: "/api/agent/act/insert",
@@ -1458,7 +1462,7 @@ const actionPaths: Record<JobAction, string> = {
 
 function splitJobPayload(action: JobAction, payload: any): any[] {
   if (action === "build") return (Array.isArray(payload?.entities) ? payload.entities : []).map((entity: any) => ({ entities: [entity] }));
-  if (["mine", "move", "rotate", "set-recipe"].includes(action)) {
+  if (["mine", "move", "rotate", "set-recipe", "launch-rocket"].includes(action)) {
     return (Array.isArray(payload?.targets) ? payload.targets : []).map((target: any) => ({ targets: [target] }));
   }
   return [payload ?? {}];
@@ -2196,6 +2200,33 @@ async function handleApi(req: IncomingMessage, res: ServerResponse) {
         data: { results },
         truncated: targets.length > trimmed.length,
       });
+    } catch (err: any) {
+      return json(res, 500, { error: err?.message || "RCON command failed" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/agent/act/launch-rocket") {
+    let body: any;
+    try {
+      body = await readJson(req);
+    } catch (err: any) {
+      return json(res, 400, { error: err?.message || "Invalid JSON" });
+    }
+    if (!rconConfigured()) return json(res, 409, { error: "RCON not configured" });
+    if (!state.rcon.connected) return json(res, 409, { error: "RCON not connected" });
+    const targets: any[] = Array.isArray(body?.targets) ? body.targets : [];
+    const max = clampInt(body?.limits?.max, AGENT_MAX_ACTIONS, 1, AGENT_MAX_ACTIONS);
+    const trimmed = targets.slice(0, max);
+    try {
+      const results = [];
+      const job = currentJob;
+      for (const target of trimmed) {
+        results.push(await launchRocket(
+          { x: target?.x, y: target?.y }, moveNearEntity, rconCommand,
+          () => Boolean(job?.cancel_requested) || (runManager.busy && !runManager.acceptingActions),
+        ));
+      }
+      return json(res, 200, { ok: true, data: { results }, truncated: targets.length > trimmed.length });
     } catch (err: any) {
       return json(res, 500, { error: err?.message || "RCON command failed" });
     }

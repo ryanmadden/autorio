@@ -225,6 +225,23 @@ Actions wait for completion by default. Pass `detach=True` and optionally an
 creation, game startup, final saving, and shutdown automatically. Manual game
 lifecycle endpoints remain available through the Python client for diagnostics.
 
+Launch a ready rocket silo through the same job interface:
+
+```python
+silo = data_value(client.observe_entity([{"x": 10, "y": 12}]))["results"][0]
+if silo["rocket"]["ready"]:
+    job = client.launch_rocket([{"x": 10, "y": 12}])
+    assert action_job_ok(job)
+```
+
+The CLI equivalent is `python3 factorio.py act-launch-rocket --target 10,12`.
+The character walks into reach, and Factorio checks the launch conditions.
+Silo observations include `rocket.parts`, `parts_required`, `silo_status`, `ready`,
+and the force's `rockets_launched`. `ready` means the silo has reached the
+`rocket_ready` animation state; the launch action can still reject the request
+if other game conditions prevent launch. Success returns `launch_initiated: true`;
+the rocket benchmark completes only when the game's recorded launch count rises.
+
 ## Vanilla-compatible evaluation controls
 
 `observe-map` exposes only chunks charted by the player's force:
