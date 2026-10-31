@@ -208,7 +208,7 @@ test("quota errors checkpoint immediately, survive manager restart, and resume t
   stored.video.state="rendering";stored.segments[0].video.state="rendering";
   fs.mkdirSync(path.join(folder,"video"),{recursive:true});
   fs.writeFileSync(path.join(folder,"video","timelapse.mp4"),"converted fixture");
-  fs.writeFileSync(path.join(folder,"video","timelapse.json"),JSON.stringify({fps:30,frames:30}));
+  fs.writeFileSync(path.join(folder,"video","timelapse.json"),JSON.stringify({fps:30.000001907348633,frames:30}));
   fs.writeFileSync(path.join(folder,"run.json"),JSON.stringify(stored));
   manager=env.reload();assert.equal(manager.get(run.id).video.state,"ready");assert.equal(manager.get(run.id).state,"paused");assert.equal(manager.get(run.id).resumable,true);
   await new Promise(r=>setTimeout(r,300));

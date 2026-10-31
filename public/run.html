@@ -12,7 +12,7 @@
     </section>
     <section aria-label="Run information"><h2>Run information</h2><dl id="runInfo" class="run-info"></dl><p id="task" class="muted"></p><p id="tokenUsage"></p><details><summary>Versions and configuration hashes</summary><pre id="configuration"></pre></details></section>
     <section id="segmentsPanel" hidden><h2>Run segments</h2><p id="checkpoint" class="muted"></p><p id="resumeNote" class="muted"></p><div id="segments"></div></section>
-    <section id="videoPanel" hidden><h2>Timelapse recording</h2><p id="videoStatus" class="muted"></p><video id="runVideo" controls playsinline preload="metadata" hidden></video><p><a id="videoDownload" hidden>Download 6× timelapse</a></p></section>
+    <section id="videoPanel" hidden><h2>Timelapse recording</h2><label id="videoSegmentLabel" hidden>Segment <select id="videoSegment"></select></label><p id="videoStatus" class="muted"></p><video id="runVideo" controls playsinline preload="metadata" hidden></video><p><a id="videoDownload" hidden>Download 6× timelapse</a></p></section>
     <section id="productionChartPanel" aria-label="Production graph">
       <div class="section-title"><h2>Production over time</h2><a id="telemetryDownload">Download telemetry</a></div>
       <form><label>Item<select id="chartItem"></select></label><label>Measure<select id="chartMeasure"><option value="total">Total produced</option><option value="rate">Produced per game minute</option></select></label><label>Time axis<select id="chartTime"><option value="wall">Active play time</option><option value="game">Game time</option></select></label></form>

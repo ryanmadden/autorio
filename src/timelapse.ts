@@ -17,13 +17,17 @@ export async function buildTimelapseTool() {
   })();
   try{await building;}finally{building=undefined;}
 }
+export function verifyTimelapseMetadata(metadata:any) {
+  // AVFoundation reports nominal frame rates as floats (e.g. 30.0000019).
+  if(!Number.isFinite(metadata?.fps) || Math.abs(metadata.fps-30)>0.01 || !Number.isInteger(metadata?.frames) || metadata.frames<1)throw new Error("Timelapse output verification failed");
+}
 export async function renderTimelapse(source:string,dir:string) {
   await buildTimelapseTool();
   const target=path.join(dir,"timelapse.mp4"),temporary=path.join(dir,"timelapse.partial.mp4");
   fs.rmSync(temporary,{force:true});
   const {stdout}=await execFileAsync(TIMELAPSE_TOOL,[source,temporary],{timeout:12*60*60*1000,maxBuffer:1024*1024});
   const metadata=JSON.parse(stdout);
-  if(metadata.fps!==30 || metadata.frames<1)throw new Error("Timelapse output verification failed");
+  verifyTimelapseMetadata(metadata);
   fs.renameSync(temporary,target);fs.writeFileSync(path.join(dir,"timelapse.json"),JSON.stringify(metadata,null,2));
   return {file:target,...metadata};
 }

@@ -11,7 +11,7 @@ import { pacificTimestamp, modelLabel, REASONING_LEVELS, ReasoningLevel } from "
 import {quotaError} from "./quota.js";
 import { sessionUsage } from "./token-usage.js";
 import {ObsRunRecorder,obsEnabled,ensureObsRunning,connectObs} from "./obs.js";
-import {renderTimelapse} from "./timelapse.js";
+import {renderTimelapse,verifyTimelapseMetadata} from "./timelapse.js";
 import { openRunRecording } from "./recording-window.js";
 
 export type RunState = "preparing" | "launching" | "running" | "saving" | "completed" | "failed" | "stopped" | "timed_out" | "interrupted" | "paused";
@@ -92,7 +92,8 @@ export class RunManager {
         try {
           const metadata=JSON.parse(fs.readFileSync(path.join(dir,"video","timelapse.json"),"utf8"));
           const file=path.join(dir,"video","timelapse.mp4");
-          if(metadata.fps!==30 || metadata.frames<1 || !fs.existsSync(file))throw new Error("Conversion incomplete");
+          verifyTimelapseMetadata(metadata);
+          if(!fs.existsSync(file))throw new Error("Conversion incomplete");
           Object.assign(segment.video,{state:"ready",file:path.relative(this.dir(run),file),metadata});
         } catch {
           segment.video.state="failed";segment.video.error="Manager exited during conversion; the original recording is retained";

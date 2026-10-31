@@ -2,6 +2,23 @@ import {ProductionChart} from "./production-chart.js";
 import {$,api,text,renderProgress,recordingUrl} from "./run-view.js";
 const id = new URLSearchParams(location.search).get("run"), chart = new ProductionChart();
 let offset = 0, polling = false;
+let videoSegments = [], selectedVideoSegment = null;
+function renderVideo() {
+  const segment = videoSegments.find(segment=>String(segment.index)===selectedVideoSegment);
+  const video = segment?.video;
+  $("videoStatus").textContent=video ? video.error || `${video.state} · 5 fps capture → 30 fps playback · silent 6× speed` : "";
+  const ready=video?.state==="ready";
+  $("runVideo").hidden=!ready;$("videoDownload").hidden=!ready;
+  if(ready) {
+    const url=`/api/runs/${encodeURIComponent(id)}/video${segment.index?`?segment=${segment.index}`:""}`;
+    if($("runVideo").getAttribute("src")!==url)$("runVideo").src=url;
+    $("videoDownload").href=url;
+    $("videoDownload").download=`${id}${segment.index?`-segment-${segment.index}`:""}-6x.mp4`;
+  } else if($("runVideo").hasAttribute("src")) {
+    $("runVideo").pause();$("runVideo").removeAttribute("src");$("runVideo").load();
+  }
+}
+$("videoSegment").onchange=()=>{selectedVideoSegment=$("videoSegment").value;renderVideo();};
 async function refresh() {
   if (polling || !id) return; polling = true;
   try {
@@ -20,17 +37,19 @@ async function refresh() {
       else if(segment.video)row.append(` · video ${segment.video.state}`);
       return row;
     }));
-    $("videoPanel").hidden=!run.video;
-    if(run.video) {
-      $("videoStatus").textContent=run.video.error || `${run.video.state} · 5 fps capture → 30 fps playback · silent 6× speed`;
-      if(run.video.state==="ready") {
-        const segment=run.segments?.at(-1)?.index;
-        const url=`/api/runs/${encodeURIComponent(id)}/video${segment?`?segment=${segment}`:""}`;
-        if($("runVideo").getAttribute("src")!==url)$("runVideo").src=url;
-        $("runVideo").hidden=false;$("videoDownload").hidden=false;$("videoDownload").href=url;$("videoDownload").download=`${id}-6x.mp4`;
-      }
+    videoSegments=(run.segments || []).map((segment,index,segments)=>({index:segment.index,video:index===segments.length-1 ? run.video || segment.video : segment.video})).filter(segment=>segment.video);
+    if(!videoSegments.length && run.video)videoSegments=[{index:"",video:run.video}];
+    $("videoPanel").hidden=!videoSegments.length;
+    $("videoSegmentLabel").hidden=!videoSegments.some(segment=>segment.index);
+    if(!videoSegments.some(segment=>String(segment.index)===selectedVideoSegment)) {
+      selectedVideoSegment=String((videoSegments.findLast(segment=>segment.video.state==="ready") || videoSegments.at(-1))?.index ?? "");
     }
-    if(run.video?.state!=="ready"){$("runVideo").hidden=true;$("videoDownload").hidden=true;}
+    const options=videoSegments.map(segment=>({value:String(segment.index),label:`Segment ${segment.index} · ${segment.video.state}`}));
+    if(JSON.stringify(options)!==JSON.stringify(Array.from($("videoSegment").options,option=>({value:option.value,label:option.textContent})))) {
+      $("videoSegment").replaceChildren(...options.map(option=>{const node=text("option",option.label);node.value=option.value;return node;}));
+    }
+    $("videoSegment").value=selectedVideoSegment;
+    renderVideo();
     $("recordingLink").href = recordingUrl(id); $("recordingLink").hidden=false;
     const info = {Benchmark:run.benchmark.title, Seed:run.benchmark.map_gen.seed, Model:run.model_label || run.agent, "Time limit":`${run.max_seconds}s`, "Sampling interval":`${run.benchmark.sample_seconds}s`, "Created (Pacific)":new Date(run.created_at).toLocaleString("en-US",{timeZone:"America/Los_Angeles",timeZoneName:"short"}), "Run ID":run.id};
     $("runInfo").replaceChildren(...Object.entries(info).flatMap(([key,value])=>[text("dt",key),text("dd",String(value))]));
