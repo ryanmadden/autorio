@@ -68,7 +68,10 @@ local function request_path(a,p)
     bounding_box=p.character.prototype.collision_box,collision_mask=p.character.prototype.collision_mask,
     start=p.position,goal=a.goal,force=p.force,radius=a.radius,entity_to_ignore=p.character,
     can_open_gates=true,path_resolution_modifier=2,
-    pathfind_flags={allow_destroy_friendly_entities=false,allow_paths_through_own_entities=false}
+    -- Prefer sustained diagonal/cardinal legs over a staircase of tiny turns.
+    -- Fresh paths also respond to buildings placed since the previous action.
+    pathfind_flags={allow_destroy_friendly_entities=false,allow_paths_through_own_entities=false,
+      prefer_straight_paths=true,cache=false}
   }
 end
 local function begin_mining(a,p)
@@ -119,8 +122,12 @@ local function update(a,p)
   end
   local point=a.path and a.path[a.path_index]
   while point and distance(p.position,point.position)<0.22 do
+    if a.kind=='move' and a.path_index==#a.path then break end
     a.path_index=a.path_index+1;point=a.path[a.path_index]
   end
+  -- The pathfinder can end near the requested position. Walk to the actual
+  -- move target instead of dropping the final waypoint just outside tolerance.
+  if point and a.kind=='move' and a.path_index==#a.path then point={position=a.goal} end
   if not point then
     -- Reach is entity-specific: rocks/trees can have a smaller interaction
     -- range than containers. Tighten a pathfinder radius that stopped too far
