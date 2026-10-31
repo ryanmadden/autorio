@@ -8,6 +8,17 @@ function svg(tag, attributes, text) {
 }
 export const ALL_ITEMS = "*", EACH_ITEM = "**";
 const COLORS=["#d5ed9b","#88bbdf","#f2b880","#dca5dd","#7dd3bd","#f08e91","#c6b8ff","#e5d173","#85c5e6","#b7cc87"];
+function productionScale(max) {
+  const roughStep = max / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+  const step = [1, 2, 2.5, 5, 10].find(value => value * magnitude >= roughStep) * magnitude;
+  const intervals = Math.ceil(max / step);
+  return { max: intervals * step, ticks: Array.from({ length: intervals + 1 }, (_, i) => i * step) };
+}
+function productionLabel(value) {
+  const [divisor, suffix] = value >= 1e9 ? [1e9, "b"] : value >= 1e6 ? [1e6, "m"] : value >= 1e3 ? [1e3, "k"] : [1, ""];
+  return `${Number((value / divisor).toFixed(6))}${suffix}`;
+}
 export function productionSeries(samples, baseline, selection, rate, game) {
   const names=[...new Set(samples.flatMap(sample=>Object.keys(sample.production || {})))].sort();
   const value=(sample,item)=>rate?(sample.production_per_game_minute?.[item] || 0):(sample.production?.[item] ?? baseline[item] ?? 0)-(baseline[item] || 0);
@@ -30,24 +41,32 @@ export class ProductionChart {
   async update(run) {
     if (this.id !== run.id) this.reset(run.id);
     const id = run.id;
-    const response = await fetch(`/api/runs/${encodeURIComponent(id)}/log?source=telemetry&offset=${this.offset}`);
-    if (!response.ok) return;
-    const log = await response.json();
-    if (id !== this.id) return;
-    this.run = run;
-    this.pending += this.decoder.decode(Uint8Array.from(atob(log.data || ""), c => c.charCodeAt(0)), { stream: true });
-    let newline;
-    while ((newline = this.pending.indexOf("\n")) >= 0) {
-      const line = this.pending.slice(0, newline); this.pending = this.pending.slice(newline + 1);
-      try { this.samples.push(JSON.parse(line)); } catch { /* Incomplete records retry on subsequent polls. */ }
+    const live = ["preparing", "launching", "running", "saving"].includes(run.state);
+    let receivedData = false;
+    while (true) {
+      const response = await fetch(`/api/runs/${encodeURIComponent(id)}/log?source=telemetry&offset=${this.offset}`);
+      if (!response.ok) return;
+      const log = await response.json();
+      if (id !== this.id) return;
+      this.run = run;
+      this.pending += this.decoder.decode(Uint8Array.from(atob(log.data || ""), c => c.charCodeAt(0)), { stream: true });
+      let newline;
+      while ((newline = this.pending.indexOf("\n")) >= 0) {
+        const line = this.pending.slice(0, newline); this.pending = this.pending.slice(newline + 1);
+        try { this.samples.push(JSON.parse(line)); } catch { /* Incomplete records retry on subsequent polls. */ }
+      }
+      receivedData ||= Boolean(log.data);
+      const previousOffset = this.offset;
+      this.offset = log.offset;
+      // Historical charts render once, after catching up, rather than replaying one chunk per poll.
+      if (live || !log.data || this.offset <= previousOffset) break;
     }
-    this.offset = log.offset;
     const names = [...new Set(this.samples.flatMap(s => Object.keys(s.production || {})))].sort();
     const chosen = $("chartItem").value;
     $("chartItem").replaceChildren(...[[ALL_ITEMS,"All items combined"],[EACH_ITEM,"All items separately"],...names.map(name=>[name,name])].map(([name,label]) => { const option = document.createElement("option"); option.value = name; option.textContent = label; return option; }));
     if ([ALL_ITEMS,EACH_ITEM,...names].includes(chosen)) $("chartItem").value = chosen;
     this.draw();
-    if (log.data) {
+    if (receivedData) {
       if (this.downloadUrl) URL.revokeObjectURL(this.downloadUrl);
       this.downloadUrl = URL.createObjectURL(new Blob([JSON.stringify({ run: id, name: run.name, model: run.model, reasoning_effort: run.reasoning_effort, baseline: run.baseline, usage: run.usage, usage_status: run.usage_status, samples: this.samples, milestones: run.milestones, definitions: run.benchmark.milestones }, null, 2)], { type: "application/json" }));
       $("telemetryDownload").href = this.downloadUrl; $("telemetryDownload").download = `${id}-telemetry.json`;
@@ -61,12 +80,18 @@ export class ProductionChart {
     const time = s => game ? s.game_ticks / 60 : s.wall_seconds;
     let maxX=this.samples.reduce((max,sample)=>Math.max(max,time(sample)),1),maxY=1;
     for(const line of series)for(const point of line.points){maxX=Math.max(maxX,point.x);maxY=Math.max(maxY,point.y);}
+    const scale = productionScale(maxY);
+    maxY = scale.max;
+    const [timeUnit, timeSuffix] = maxX >= 3600 ? [3600, "h"] : maxX >= 120 ? [60, "m"] : [1, "s"];
+    const timeScale = productionScale(maxX / timeUnit);
+    maxX = timeScale.max * timeUnit;
     const x = v => 60 + v / maxX * 810, y = v => 250 - v / maxY * 220;
-    for (let i = 0; i <= 4; i++) {
-      const a = i / 4;
-      chart.append(svg("line", { x1: 60, x2: 870, y1: y(maxY*a), y2: y(maxY*a), stroke: "#303a40" }));
-      chart.append(svg("text", { x: 50, y: y(maxY*a)+4, "text-anchor": "end" }, (maxY*a).toFixed(maxY < 10 ? 1 : 0)));
-      chart.append(svg("text", { x: x(maxX*a), y: 275, "text-anchor": "middle" }, maxX < 120 ? `${(maxX*a).toFixed(1)}s` : `${(maxX*a/60).toFixed(1)}m`));
+    for (const tick of scale.ticks) {
+      chart.append(svg("line", { x1: 60, x2: 870, y1: y(tick), y2: y(tick), stroke: "#303a40" }));
+      chart.append(svg("text", { x: 50, y: y(tick)+4, "text-anchor": "end" }, productionLabel(tick)));
+    }
+    for (const tick of timeScale.ticks) {
+      chart.append(svg("text", { x: x(tick * timeUnit), y: 275, "text-anchor": "middle" }, `${Number(tick.toFixed(6))}${timeSuffix}`));
     }
     for(const line of series) {
       const polyline=svg("polyline",{points:line.points.map(p=>`${x(p.x)},${y(p.y)}`).join(" "),fill:"none",stroke:line.color,"stroke-width":2});
@@ -76,10 +101,18 @@ export class ProductionChart {
     if(legend)legend.replaceChildren(...series.map(line=>{const span=document.createElement("span");span.textContent=line.name;span.style.color=line.color;return span;}));
     const markers = this.run.benchmark.milestones.filter(m => m.kind === "research" && m.name?.endsWith("-science-pack") && this.run.milestones[m.id]);
     $("researchMarkers").replaceChildren(...markers.map((m, index) => {
-      const result = this.run.milestones[m.id], label = `${index+1}. ${m.label || m.name}: ${(time(result)/60).toFixed(2)}m${result.initial ? " (already unlocked at start)" : ""}`;
+      const result = this.run.milestones[m.id], label = `${m.label || m.name}: ${(time(result)/60).toFixed(2)}m${result.initial ? " (already unlocked at start)" : ""}`;
+      const iconUrl = `/icons/${encodeURIComponent(m.name)}.png`;
       const line = svg("line", { x1:x(time(result)), x2:x(time(result)), y1:30, y2:250, stroke:"#88bbdf", "stroke-dasharray":"4 4" });
-      line.append(svg("title", {}, label)); chart.append(line, svg("text", { x:x(time(result))+4, y:20+(index%2)*15 }, String(index+1)));
-      const span = document.createElement("span"); span.className = "milestone done"; span.textContent = label; return span;
+      const tag = svg("g", { transform:`translate(${x(time(result))},${16+(index%2)*28})`, role:"img", "aria-label":label });
+      tag.append(svg("title", {}, label),
+        svg("rect", { x:-13, y:-13, width:26, height:26, rx:5, fill:"#101315", stroke:"#88bbdf" }),
+        svg("image", { href:iconUrl, x:-11, y:-11, width:22, height:22 }));
+      line.append(svg("title", {}, label)); chart.append(line, tag);
+      const span = document.createElement("span"); span.className = "milestone done science-marker";
+      const icon = document.createElement("img"); icon.src = iconUrl; icon.alt = ""; icon.width = 22; icon.height = 22;
+      const text = document.createElement("span"); text.textContent = label;
+      span.append(icon, text); return span;
     }));
     $("chartNote").textContent = `${item===ALL_ITEMS?"All items combined":item===EACH_ITEM?"All items separately":item || "No items produced yet"} · ${rate ? "items / game minute" : "total items produced since start"} · ${game ? "game time" : "active play time"}. Research markers use first observation (up to ${this.run.benchmark.sample_seconds}s sampling delay).${item===ALL_ITEMS?" Counts all item outputs, including intermediate products; this is an unweighted total, not inventory or net production.":""}`;
   }

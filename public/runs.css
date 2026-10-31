@@ -40,3 +40,5 @@ body.recording main { display:none; }
 #runVideo { width:100%; max-height:70vh; background:#000; margin-top:10px; }
 
 .chart-legend { display:flex; flex-wrap:wrap; gap:6px 16px; max-height:140px; overflow:auto; font-size:12px; margin:12px 0; }
+.science-marker { display:inline-flex; align-items:center; gap:6px; }
+.science-marker img { flex:none; object-fit:contain; }
